@@ -85,7 +85,7 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         // TODO: ? do we want to try do float to int conversions...
         // For now make the result unknown.
         // TODO: emit some error for the user?
-        INTERNAL_NOTE << " Encountered FloatingLiteral, interpreting as an unknown value..."
+        INTERNAL_NOTE << " Encountered FloatingLiteral, interpreting as an unknown value... "
                       << loc_str(E) << "\n";
         goto successful_return;
     } else if (const auto *default_arg = dyn_cast<CXXDefaultArgExpr>(E)) {
@@ -164,6 +164,7 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
     {                                                                                              \
         if (state.vars[VD].has_value())                                                            \
             state.vars[VD].value() OP rhs_res.val.value();                                         \
+        result.val = state.vars[VD];                                                               \
         state.all_possible_vals[VD].insert(state.vars[VD]);                                        \
         goto successful_return;                                                                    \
     }
