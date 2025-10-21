@@ -44,6 +44,7 @@ class TopLevelVisitor : public GeneralVisitor, public RecursiveASTVisitor<TopLev
         int stmt_sequence;        // sequence number of full statements in loops.  Full stmts
                                   // separated by ;
         bool in_loop_body;        // true if in site loop
+        Stmt *current_loop_body;  // ptr to the site loop body or null if not in_loop_body
         bool accept_field_parity; // if parity of loop not resolved yet
         bool loop_function_next;
     } parsing_state;
@@ -60,6 +61,7 @@ class TopLevelVisitor : public GeneralVisitor, public RecursiveASTVisitor<TopLev
         parsing_state.ast_depth = 1;
         parsing_state.stmt_sequence = 0;
         parsing_state.in_loop_body = false;
+        parsing_state.current_loop_body = nullptr;
         parsing_state.accept_field_parity = false;
         parsing_state.loop_function_next = false;
     }
