@@ -253,6 +253,7 @@ HEADERS = \
   $(SRCDIR)/srcbuf.h \
   $(SRCDIR)/stringops.h \
   $(SRCDIR)/optionsparser.h \
+  $(SRCDIR)/idx_expr_evaluator.h \
   ../libraries/hila_signatures.h
 
 
@@ -280,6 +281,7 @@ OBJECTS = \
   $(BUILDDIR)/addrof_and_ref_visitor.o \
   $(BUILDDIR)/optionsparser.o \
   $(BUILDDIR)/sourceloc_utils.o \
+  $(BUILDDIR)/idx_expr_evaluator.o \
   $(BUILDDIR)/write_output.o
 
 
