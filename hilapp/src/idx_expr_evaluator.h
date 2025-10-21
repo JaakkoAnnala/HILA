@@ -8,6 +8,8 @@
 
 using namespace clang;
 
+// TODO: check llvm version requirement...
+
 #define MAX_BLOCK_VISITS 100 // TODO: make this cofigurable
 
 struct Eval_state {
