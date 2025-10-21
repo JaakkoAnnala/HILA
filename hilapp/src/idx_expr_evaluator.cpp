@@ -81,6 +81,13 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
 
         result.val = IL->getValue().getSExtValue();
         goto successful_return;
+    } else if (const auto *FL = dyn_cast<FloatingLiteral>(E)) {
+        // TODO: ? do we want to try do float to int conversions...
+        // For now make the result unknown.
+        // TODO: emit some error for the user?
+        INTERNAL_NOTE << " Encountered FloatingLiteral, interpreting as an unknown value..."
+                      << loc_str(E) << "\n";
+        goto successful_return;
     } else if (const auto *default_arg = dyn_cast<CXXDefaultArgExpr>(E)) {
         // This takes care of functions with default arguments
         Eval_result default_val{};
@@ -874,9 +881,10 @@ bool Idx_expr_evaluator::exec() {
     return eval_CFG_block(*main_entry_block, main_state, *ASTctx);
 }
 
-// bool Idx_expr_evaluator::get_possible_vals_for_expr(Expr *E, const std::set<std::optional<int64_t>> &vals) const {}
+// bool Idx_expr_evaluator::get_possible_vals_for_expr(Expr *E, const
+// std::set<std::optional<int64_t>> &vals) const {}
 
-void Idx_expr_evaluator::print_eval_diags(llvm::raw_ostream &os){
+void Idx_expr_evaluator::print_eval_diags(llvm::raw_ostream &os) {
     os << diag_msg;
 };
 
