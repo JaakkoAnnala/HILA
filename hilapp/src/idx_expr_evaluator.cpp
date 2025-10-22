@@ -189,18 +189,41 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         } else {
             // TODO: !!! check c++ specs if the order of evaluation is defined... LHS evaluated
             // first
-            Eval_result lhs_res{};
-            if (!eval_expr(lhs_res, LHS, state, ASTctx))
-                return false;
-            Eval_result rhs_res{};
-            if (!eval_expr(rhs_res, RHS, state, ASTctx))
-                return false;
-
-            // If we dont know the values just return the nullopt
-            if (!(lhs_res.val.has_value() && rhs_res.val.has_value()))
-                goto successful_return;
-
             auto op = BO->getOpcode();
+
+            Eval_result lhs_res{};
+            if (!eval_expr(lhs_res, LHS, state, ASTctx)) return false;
+            if (!lhs_res.val.has_value())
+                goto successful_return; // We dont know the values just return the nullopt
+
+            Eval_result rhs_res{};
+            // special cases || and &&
+            if (op == BO_LAnd) {
+                //// [C99 6.5.13] Logical AND operator.
+                // eval rhs only if lhs is true
+                if (lhs_res.val) {
+                    if (!eval_expr(rhs_res, RHS, state, ASTctx)) return false;
+                    result.val = lhs_res.val.value() && rhs_res.val.value();
+                } else {
+                    result.val = lhs_res.val.value();
+                }
+                goto successful_return;
+            } else if (op == BO_LOr) {
+                //// [C99 6.5.14] Logical OR operator.
+                // eval rhs only if lhs is false
+                if (!lhs_res.val) {
+                    if (!eval_expr(rhs_res, RHS, state, ASTctx)) return false;
+                    result.val = lhs_res.val.value() || rhs_res.val.value();
+                } else {
+                    result.val = lhs_res.val.value();
+                }
+                goto successful_return;
+            }
+
+            if (!eval_expr(rhs_res, RHS, state, ASTctx)) return false;
+            if (!rhs_res.val.has_value())
+                goto successful_return; // We dont know the values just return the nullopt
+
             switch (op) {
 
 // temp helper macro to generate all the similar cases
@@ -237,10 +260,6 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             case BO_Xor:  BOP_EXPR(^); break;
                 //// [C99 6.5.12] Bitwise OR operator.
             case BO_Or:  BOP_EXPR(|); break;
-                //// [C99 6.5.13] Logical AND operator.
-            case BO_LAnd:  BOP_EXPR(&&); break;
-                //// [C99 6.5.14] Logical OR operator.
-            case BO_LOr:  BOP_EXPR(||); break;
                 // clang-format on
                 //// [C99 6.5.17] Comma operator.
                 // BO_Comma // ","
