@@ -152,11 +152,13 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             // TODO: for now LHS has to be a simple VarRefDecl
             const auto *dreLHS = dyn_cast<DeclRefExpr>(LHS->IgnoreParenImpCasts());
             if (!dreLHS) {
-                INTERNAL_ERROR
-                    << "Expecting binary assignment operators LHS to be DeclRefExpr: insted it is `"
-                    << LHS->IgnoreParenBaseCasts()->getStmtClassName() << "` " << loc_str(LHS)
+                INTERNAL_NOTE
+                    << "Only evaluating assignments if LHS is DeclRefExpr: Here it is instead `"
+                    << LHS->IgnoreParenBaseCasts()->getStmtClassName() << "` Not evaluating. " << loc_str(LHS)
                     << "\n";
-                return false;
+                // TODO: maybe some cases could be evaluated?
+                result.val = std::nullopt;
+                goto successful_return;
             }
             const auto *VD = dyn_cast<VarDecl>(dreLHS->getDecl());
             if (!VD) {
