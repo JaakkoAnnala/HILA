@@ -26,6 +26,8 @@ struct Eval_state {
     // return_val is nullopt.
     std::optional<int64_t> return_val = std::nullopt;
 
+    std::unordered_map<const Expr *, std::optional<int64_t>> block_expr_state;
+
     // Track how many times we have visited each block in the control flow graph `CFG`.
     // This needs to be done so we can limit the amount of times we allow the evaluation to evaluate
     // e.g. loops.
