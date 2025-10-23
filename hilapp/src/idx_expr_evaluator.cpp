@@ -115,6 +115,14 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             return false;
         result = default_val;
         goto successful_return;
+
+    } else if (const auto *PE = dyn_cast<ParenExpr>(E)) {
+        Eval_result paren_expr_val{};
+        if (!eval_expr(paren_expr_val, PE->getSubExpr(), state, ASTctx))
+            return false;
+        result = paren_expr_val;
+        goto successful_return;
+
     } else if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts())) {
 
         // check if its an enum constant
