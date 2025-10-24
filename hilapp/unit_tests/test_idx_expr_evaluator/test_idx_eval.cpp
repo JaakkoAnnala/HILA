@@ -1,6 +1,7 @@
 
 // Some unit tests for Idx_expr_evaluator
 
+#include "clang/ASTMatchers/ASTMatchFinder.h"
 #include "clang/ASTMatchers/ASTMatchers.h"
 #include "clang/Tooling/Tooling.h"
 #include "clang/Tooling/CompilationDatabase.h"
@@ -13,53 +14,48 @@ using namespace clang::ast_matchers;
 
 #include "../../src/idx_expr_evaluator.h"
 #define DIAGS_TO_STR
-#include "../../src/idx_expr_evaluator.cpp" // yes this is intentional
+#include "../../src/idx_expr_evaluator.cpp" // yes this is intentional, diag_msg
 
 /////////////////////////////////////////////////////////////////
 // Setup stuff for tests
 
 class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
   public:
-    Eval_state state{};
+    Idx_expr_evaluator evaluator{};
 
     std::unordered_map<uintptr_t, std::string> names;
+
+    bool exec_ret;
 
   public:
     void run(const MatchFinder::MatchResult &Result) override {
         diags.enable_colors(true);
-        ASTContext &ASTctx = *Result.Context;
-        state = {};
+        diag_msg.clear();
+        ASTContext *ASTctx = Result.Context;
 
         // the function we analyse for testing:
-        const FunctionDecl *Func = Result.Nodes.getNodeAs<FunctionDecl>("func");
-        if (!Func || !Func->hasBody())
+        const FunctionDecl *func = Result.Nodes.getNodeAs<FunctionDecl>("func");
+        if (!func || !func->hasBody())
             return;
-        auto *FB = Func->getBody();
+        auto *FB = func->getBody();
 
-        CFG::BuildOptions CFG_BO;
-        auto CFG = CFG::buildCFG(Func, FB, &ASTctx, CFG_BO);
-
-        auto entry_block = CFG->getEntry();
-        auto exit_block = CFG->getExit();
-        state.exit_block = &exit_block;
-
-        bool ret = eval_CFG_block(entry_block, state, ASTctx);
+        evaluator = {};
+        evaluator.init(func, FB, ASTctx);
+        exec_ret = evaluator.exec();
 
         // After ToolInvocation the Compiler context may get freed so store the names now
         // Use the pointers as keys
-        for (auto &all_vals : state.all_possible_vals) {
+        for (auto &all_vals : evaluator.main_state.all_possible_vals) {
             names[(uintptr_t)all_vals.first] = all_vals.first->getNameAsString();
         }
 
-        if (!ret) {
+        if (!exec_ret) {
             llvm::errs() << diag_msg;
         }
     }
 };
 
-// Eval the compund statement given in string
-#define TEST_EVAL_STRING_CSTMT(str)                                                                \
-    std::string code = "void test() {" str "}";                                                    \
+#define TEST_EVAL_COMMON_                                                                          \
     std::string fname = "input.cpp";                                                               \
     std::vector<std::string> args = {"clang-tool", "-std=c++17", fname};                           \
     FixedCompilationDatabase Compilations(".", args);                                              \
@@ -76,9 +72,19 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
     ToolInvocation Invocation(args, std::move(action),                                             \
                               Files); /*this seems to free Files, .. eventhoug a comment says it   \
                                          does not take ownership..*/                               \
-    const auto &test_state = test_analyzer.state;                                                  \
+    const auto &test_state = test_analyzer.evaluator.main_state;                                   \
     const auto &test_names = test_analyzer.names;                                                  \
     Invocation.run();
+
+// Eval the compound statement given in string
+#define TEST_EVAL_STRING_CSTMT(str)                                                                \
+    std::string code = "void test() {" str "}";                                                    \
+    TEST_EVAL_COMMON_
+
+// Eval the compound statement given in string
+#define TEST_EVAL_STRING_TOPLVL(str)                                                               \
+    std::string code = str;                                                                        \
+    TEST_EVAL_COMMON_
 
 const std::set<std::optional<int64_t>> *
 get_possible_values_for_var(std::string var_name, const Eval_state &state,
@@ -263,6 +269,9 @@ bool test_basic_if_decl() {
     )")
     /////////////////////////////////////////////
     // clang-format off
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
+// your code for which the warning gets suppressed 
     // Really evaluate it 
     TrackedVar<int> a = 0;
     TrackedVar<int> i = 0;
@@ -270,6 +279,7 @@ bool test_basic_if_decl() {
     else {a = 1234;}
     // clang-format on
     /////////////////////////////////////////////
+#pragma clang diagnostic pop
     // Compare results
     COMPARE_AND_SET_TEST_PASS(a);
     COMPARE_AND_SET_TEST_PASS(i);
@@ -734,6 +744,80 @@ bool test_lots_of_control_flow_things_1() {
     TEST_CASE_END;
 }
 
+
+bool test_constexpr_func() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Our ast_eval it
+    TEST_EVAL_STRING_TOPLVL(R"(
+constexpr int func1(int a){
+    return a + 2;
+}
+
+void test(){
+    int a = 1;
+    int i = 0;
+    for(i = 0; i < 10; ++i){
+        a = func1(a);
+    }
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it 
+// use a lambda so we can keep it contained in the test_constexpr_func() ...
+// constexpr int func1(int a){
+constexpr auto func1 = [](int a){
+    return a + 2;
+};
+//void test(){
+    TrackedVar<int> a = 1;
+    TrackedVar<int> i = 0;
+    for(i = 0; i < 10; ++i){
+        a = func1(a);
+    }
+//}
+    // clang-format on
+    /////////////////////////////////////////////
+    // Compare results
+    COMPARE_AND_SET_TEST_PASS(a);
+    COMPARE_AND_SET_TEST_PASS(i);
+
+    TEST_CASE_END;
+}
+
+////////////////////////////////////////////////////////
+// test things that should fail exec
+
+bool test_should_fail_1() {
+    TEST_CASE_BEGIN;
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-variable"
+    /////////////////////////////////////////////
+    // Our ast_eval it
+    TEST_EVAL_STRING_TOPLVL(R"(
+
+void test(int unknown){
+    int a = 0;
+    for(int i = 0; i < unknown; ++i){
+        a++;
+    }
+}
+    )")
+#pragma clang diagnostic pop
+
+    if (test_analyzer.exec_ret)
+        test_pass = false;
+
+    TEST_CASE_END;
+}
+
+////////////////////////////////////////////////////////
+// test things that should succeed to exec but fails to track some value
+
+// TODO
+
 typedef bool (*test_func)();
 static std::vector<test_func> test_cases = {
     // clang-format off
@@ -769,6 +853,12 @@ static std::vector<test_func> test_cases = {
     //
     test_lots_of_control_flow_things_1,
 
+    // calling constexpr functions
+    test_constexpr_func,
+    
+    // should fail 
+    test_should_fail_1,
+
     // weird stuff
     // test_Lor_in_switch,
     // clang-format on
@@ -791,5 +881,5 @@ int main() {
         color_msg(llvm::outs(), GREEN, " All test cases passed.\n");
     }
 
-    return 0;
+    return n_failed;
 }
