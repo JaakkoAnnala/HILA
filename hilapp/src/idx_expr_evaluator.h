@@ -1,14 +1,44 @@
 #ifndef IDX_EXPR_EVALUATOR_H_
 #define IDX_EXPR_EVALUATOR_H_
 
+/**
+ * @file idx_expr_evaluator.h
+ * @brief Utility for analysing integer 'index like' expressions during AST analysis. Evaluates
+ * integer expressions (as much as it can) and accumulates possible different values variables and
+ * expressions obtain during evaluation.
+ * @details
+ * @note Should be tested if there are major changes to llvm. Unit tests for Idx_expr_evaluator
+ * are in ../unit_tests/test_idx_expr_evaluator. Tested with llvm 20.1.8.
+ *
+ */
 
-#include <clang/StaticAnalyzer/Frontend/FrontendActions.h>
+// Limitations:
 
+// ###### Things to NOTE / TODO ######
+
+// TODO: check llvm version requirement...
+
+// TODO: logical and &&, logical or ||, ternary statement x ? y : z NOT IMPLEMENTED YET. A bit
+// tricky due to how CFG is layed out...
+
+// TODO: At the moment we give up every time that we encounter a control flow that we cannot
+// determine which branch to take. However, if we only care about for example ´x´ in:
+//  " // y = some unknown runtime value
+//  " int x,i;
+//  " for(i=0;i<10;++i){
+//  "     x++;
+//  "     if(y > 0) do_something();
+//  " }
+// if we figure out that `do_something()` does not affect the value of `x` we could still evaluate
+// the above... probably needs a quite a bit of figuring out...
+
+
+#include <set>
+#include <optional>
 #include "clang/Analysis/CFG.h"
 
 using namespace clang;
 
-// TODO: check llvm version requirement...
 
 #define MAX_BLOCK_VISITS 100 // TODO: make this cofigurable
 

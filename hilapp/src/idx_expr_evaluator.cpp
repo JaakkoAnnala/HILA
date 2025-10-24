@@ -1,7 +1,10 @@
 #include "idx_expr_evaluator.h"
 
-#include "clang/ASTMatchers/ASTMatchFinder.h"
-#include "clang/ASTMatchers/ASTMatchers.h"
+#include <clang/AST/ASTContext.h>
+#include <clang/AST/ParentMapContext.h>
+
+//#include "clang/ASTMatchers/ASTMatchFinder.h"
+//#include "clang/ASTMatchers/ASTMatchers.h"
 
 using namespace clang;
 using namespace llvm;
@@ -94,7 +97,7 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
     result.val = std::nullopt;
 
     if (state.block_expr_state.find(E) != state.block_expr_state.end()) {
-        DEBUG_OUT << " trying to eval twice.. " << loc_str(E) << "\n";
+        // DEBUG_OUT << " trying to eval twice.. " << loc_str(E) << "\n";
         // we have already evaluated this expression
         result.val = state.block_expr_state[E];
         return true;
@@ -739,8 +742,8 @@ bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx
                 if (const auto *E = dyn_cast<Expr>(stmt)) {
                     if (!eval_expr(cond_res, E, state, ASTctx))
                         return false;
-                    DEBUG_OUT << " cond_res " << cond_res.val << " " << loc_str(E) << " "
-                              << E->getStmtClassName() << "\n";
+                    //DEBUG_OUT << " cond_res " << cond_res.val << " " << loc_str(E) << " "
+                    //          << E->getStmtClassName() << "\n";
                 } else {
                     INTERNAL_ERROR << " Expecting the last element of an block with terminator "
                                       "stmt to be an expression "

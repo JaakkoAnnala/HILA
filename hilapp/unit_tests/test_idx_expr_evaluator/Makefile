@@ -37,5 +37,5 @@ endif
 endif
 
 
-test_idx_eval: test_idx_eval.cpp tracked_var.h
+test_idx_eval: test_idx_eval.cpp tracked_var.h ../../src/idx_expr_evaluator.cpp
 	$(CC) $(CFLAGS) $(CLANG_LIBS) test_idx_eval.cpp -o test_idx_eval 
