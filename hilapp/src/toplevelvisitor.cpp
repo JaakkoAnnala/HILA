@@ -320,46 +320,62 @@ bool TopLevelVisitor::handle_field_X_expr(Expr *e, bool &is_assign, bool is_also
 
         llvm::errs() << "Loop local var type is " << frc.getLocalVarInfo()->type << '\n';
 
-        
+
         ///////////////////////////
         // TESTING:
-        Expr *track = lfe.nameExpr;
+        Expr *tracked_expr = lfe.nameExpr;
         // TODO: find more reliably the expr that depends on the local loop var
-        if(auto tmp = dyn_cast<CXXOperatorCallExpr>(lfe.nameExpr)){
-            track = tmp->getArg(1);
+        if (auto tmp = dyn_cast<CXXOperatorCallExpr>(lfe.nameExpr)) {
+            tracked_expr = tmp->getArg(1);
         }
-
-        Idx_expr_evaluator evaluator{};
         // Find enclosing FunctionDecl
         const FunctionDecl *current_func = global.currentFunctionDecl;
         // Find the compund statement linked to onsites loop
         Stmt *stmt = this->parsing_state.current_loop_body;
-        evaluator.init(current_func, stmt, this->getASTContext());
-        evaluator.add_expr_to_tracking_list(track);
-        evaluator.exec();
-        // print diagnostics accumulated during eval
-        evaluator.print_eval_diags(llvm::outs());
-        // Print tracked values
-#define loc_str(E)                                                                                 \
-    (E)->getSourceRange().getBegin().printToString(this->getASTContext()->getSourceManager())
 
+
+        Idx_expr_evaluator evaluator{};
+        evaluator.init(current_func, stmt, this->getASTContext());
+        evaluator.add_expr_to_tracking_list(tracked_expr);
+        bool exec_res = evaluator.exec();
+
+        if (!exec_res) {
+            // failed
+            // TODO: better error message
+            reportDiag(DiagnosticsEngine::Level::Error, lfe.nameExpr->getSourceRange().getBegin(),
+                       "Could not analyse field reference that depends on an expression "
+                       "inside onsites-loop");
+            // for now print evaluator diags in any case
+            // TODO: cound print these only when we fail unexpectedly
+            llvm::outs() << "---------- Idx_expr_evaluator internal diagnostics -----------\n";
+            evaluator.print_eval_diags(llvm::errs());
+            llvm::outs() << "--------------------------------------------------------------\n";
+        } else {
+            // We executed without problems, check if we could track the expr
+            auto pair = evaluator.get_vals_for_expr(tracked_expr);
+            const auto *vals = pair.first;
+            bool ok = pair.second;
+            if (!ok) {
+                // TODO: better error message
+                reportDiag(DiagnosticsEngine::Level::Error,
+                           lfe.nameExpr->getSourceRange().getBegin(),
+                           "Could not analyse field reference that depends on an expression "
+                           "inside onsites-loop");
+            }
+            assert(vals != nullptr);
+            // Do somethig
+        }
+
+        // test printing:
+        evaluator.print_vals_for_expr(llvm::outs(), tracked_expr);
+        // print diagnostics accumulated during eval
+
+
+        // Print tracked values
         llvm::outs() << "------- main_state.all_possible_vals -------\n";
-        for (auto var_vals : evaluator.main_state.all_possible_vals) {
-            llvm::outs() << loc_str(var_vals.first) << " `" << var_vals.first->getNameAsString()
-                         << "` = [ ";
-            for (auto val : var_vals.second) {
-                llvm::outs() << val << ", ";
-            }
-            llvm::outs() << " ]\n";
-        }
+        evaluator.print_all_vals_vars(llvm::outs());
         llvm::outs() << "------- main_state.possible_vals_for_expr -------\n";
-        for (auto expr_vals : evaluator.main_state.possible_vals_for_expr) {
-            llvm::outs() << loc_str(expr_vals.first) << " = [ ";
-            for (auto val : expr_vals.second) {
-                llvm::outs() << val << ", ";
-            }
-            llvm::outs() << " ]\n";
-        }
+        evaluator.print_all_vals_exprs(llvm::outs());
         ///////////////////////////
 
         reportDiag(DiagnosticsEngine::Level::Error, lfe.nameExpr->getSourceRange().getBegin(),

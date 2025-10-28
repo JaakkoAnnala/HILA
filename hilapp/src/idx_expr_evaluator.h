@@ -42,6 +42,8 @@ using namespace clang;
 
 #define MAX_BLOCK_VISITS 100 // TODO: make this cofigurable
 
+using Value_set = std::set<std::optional<int64_t>>;
+
 struct Eval_state {
 
     ////////////////////////////////////////////
@@ -69,12 +71,12 @@ struct Eval_state {
     // The results that we care about in the end
 
     // maps the Expr* to all its possible values it obtains during evaluation
-    std::unordered_map<const Expr *, std::set<std::optional<int64_t>>> possible_vals_for_expr;
+    std::unordered_map<const Expr *, Value_set> possible_vals_for_expr;
     // set to true if `possible_vals_for_expr` has reliable results
     bool eval_succeeded = false;
 
     // list all possible values of all variables we encountered during evaluation
-    std::unordered_map<const VarDecl *, std::set<std::optional<int64_t>>> all_possible_vals;
+    std::unordered_map<const VarDecl *, Value_set> all_possible_vals;
 };
 
 struct Eval_result {
@@ -87,11 +89,25 @@ struct Idx_expr_evaluator {
 
     void add_expr_to_tracking_list(const Expr *E);
 
+    // return false if we encountered something we dont handle.
     bool exec();
 
-    // bool get_possible_vals_for_expr(Expr *E, const std::set<std::optional<int64_t>> &vals) const;
+    /**
+     * @param E the Expr* we want to get the possible values for.
+     * @return pair.first = const Value_set *, pointer to the set of possible values, nullptr if the
+     * Expr *E is not in the tracked expressions. pair.second = bool, false if E not found or if the
+     * set of possible values contains unknown values (std::nullopt), meaning that we could not
+     * track the value.
+     * note: Empty set is a valid return.
+     */
+    std::pair<const Value_set *, bool> get_vals_for_expr(Expr *E) const;
 
-    void print_eval_diags(llvm::raw_ostream &os);
+
+
+    void print_vals_for_expr(llvm::raw_ostream &os, Expr *E) const;
+    void print_all_vals_vars(llvm::raw_ostream &os) const;
+    void print_all_vals_exprs(llvm::raw_ostream &os) const;
+    void print_eval_diags(llvm::raw_ostream &os) const;
     std::string &get_eval_diags_string();
 
     Eval_state main_state{};
