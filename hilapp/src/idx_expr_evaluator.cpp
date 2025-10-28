@@ -3,80 +3,66 @@
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/ParentMapContext.h>
 
-//#include "clang/ASTMatchers/ASTMatchFinder.h"
-//#include "clang/ASTMatchers/ASTMatchers.h"
-
 using namespace clang;
 using namespace llvm;
 
-#define BRED_STR(str) "\033[41m" str "\033[0m"
-#define RED_STR(str) "\033[0;31m" str "\033[0m"
-
-static std::string diag_msg;
-static raw_string_ostream diags(diag_msg);
 static constexpr raw_string_ostream::Colors RED = raw_string_ostream::RED;
 static constexpr raw_string_ostream::Colors BLUE = raw_string_ostream::BLUE;
-// static constexpr raw_string_ostream::Colors BLACK = raw_string_ostream::BLACK;
 static constexpr raw_string_ostream::Colors GREEN = raw_string_ostream::GREEN;
-// static constexpr raw_string_ostream::Colors YELLOW = raw_string_ostream::YELLOW;
-// static constexpr raw_string_ostream::Colors MAGENTA = raw_string_ostream::MAGENTA;
 static constexpr raw_string_ostream::Colors CYAN = raw_string_ostream::CYAN;
-// static constexpr raw_string_ostream::Colors WHITE = raw_string_ostream::WHITE;
-// static constexpr raw_string_ostream::Colors BRIGHT_BLACK = raw_string_ostream::BRIGHT_BLACK;
-// static constexpr raw_string_ostream::Colors BRIGHT_RED = raw_string_ostream::BRIGHT_RED;
-// static constexpr raw_string_ostream::Colors BRIGHT_GREEN = raw_string_ostream::BRIGHT_GREEN;
-// static constexpr raw_string_ostream::Colors BRIGHT_YELLOW = raw_string_ostream::BRIGHT_YELLOW;
-// static constexpr raw_string_ostream::Colors BRIGHT_BLUE = raw_string_ostream::BRIGHT_BLUE;
-// static constexpr raw_string_ostream::Colors BRIGHT_MAGENTA = raw_string_ostream::BRIGHT_MAGENTA;
-// static constexpr raw_string_ostream::Colors BRIGHT_CYAN = raw_string_ostream::BRIGHT_CYAN;
-// static constexpr raw_string_ostream::Colors BRIGHT_WHITE = raw_string_ostream::BRIGHT_WHITE;
-// static constexpr raw_string_ostream::Colors SAVEDCOLOR = raw_string_ostream::SAVEDCOLOR;
-// static constexpr raw_string_ostream::Colors RESET = raw_string_ostream::RESET;
-
-static inline raw_string_ostream &color_msg(raw_string_ostream &os,
-                                            raw_string_ostream::Colors color, const char *msg,
-                                            bool bold = true) {
-    os.changeColor(color, bold);
-    os << msg;
-    os.resetColor();
-    return os;
-}
 
 static inline raw_ostream &color_msg(raw_ostream &os, raw_ostream::Colors color, const char *msg,
                                      bool bold = true, const char *file = nullptr, int line = -1) {
-    if (file)
-        os << file;
-    if (line != -1)
-        os << ":" << line << " ";
     os.changeColor(color, bold);
     os << msg;
     os.resetColor();
+    if (file)
+        os << "(" << file;
+    if (line != -1)
+        os << ":" << line << ")";
+    os << ": ";
     return os;
 }
 
+static std::string diag_msg;
+static raw_string_ostream diags(diag_msg);
+
+#define DIAGS_TO_STR
 #ifdef DIAGS_TO_STR
-#define INTERNAL_NOTE color_msg(diags, BLUE, "INTERNAL NOTE: ")
-#define INTERNAL_ERROR color_msg(diags, RED, "INTERNAL ERROR: ")
-#define DEBUG_OUT color_msg(diags, RED, "INTERNAL DEBUG: ")
+#define DIAGS_OUT diags
 #else
-#define INTERNAL_NOTE color_msg(llvm::outs(), BLUE, "INTERNAL NOTE: ", true, __FILE__, __LINE__)
-#define INTERNAL_ERROR color_msg(llvm::outs(), RED, "INTERNAL ERROR: ", true, __FILE__, __LINE__)
-#define DEBUG_OUT color_msg(llvm::outs(), CYAN, "INTERNAL DEBUG: ", true, __FILE__, __LINE__)
+#define DIAGS_OUT llvm::outs()
 #endif
+#define INTERNAL_NOTE color_msg(DIAGS_OUT, BLUE, "INTERNAL NOTE", true, __FILE__, __LINE__)
+#define INTERNAL_ERROR color_msg(DIAGS_OUT, RED, "INTERNAL ERROR", true, __FILE__, __LINE__)
+#define DEBUG_OUT color_msg(DIAGS_OUT, CYAN, "INTERNAL DEBUG", true, __FILE__, __LINE__)
 
-
-void print_var_state(Eval_state &state, const VarDecl *var, ASTContext &ASTctx) {
-    if (state.vars.find(var) != state.vars.end()) {
-
-        llvm::outs() << var->getSourceRange().getBegin().printToString(ASTctx.getSourceManager())
-                     << " " << var->getNameAsString() << " = " << state.vars[var] << "\n";
-    } else {
-        llvm::outs() << var->getSourceRange().getBegin().printToString(ASTctx.getSourceManager())
-                     << " " << var->getNameAsString() << " : The variable is not being tracked.\n";
-    }
-}
+// Keep track of for which exprs diags have been reported. So we dont spam them multiple times..
+// Should this be moved into Eval_state?
+static std::set<const Expr *> reported_diag;
+#define INTERNAL_NOTE_IF(E)                                                                        \
+    if (reported_diag.find(E) == reported_diag.end() &&                                            \
+        reported_diag.insert(E)                                                                    \
+            .second /*this should always return true, its here just to insert the Expr*/)          \
+    INTERNAL_NOTE
 
 #define loc_str(S) (S)->getSourceRange().getBegin().printToString(ASTctx.getSourceManager())
+#define loc_strp(S) (S)->getSourceRange().getBegin().printToString(ASTctx->getSourceManager())
+
+template <unsigned N>
+void report_diag(const ASTContext &ctx, DiagnosticsEngine::Level lev, const SourceLocation &SL,
+                 const char (&msg)[N], const char *s1 = nullptr, const char *s2 = nullptr,
+                 const char *s3 = nullptr) {
+    auto &DE = ctx.getDiagnostics();
+    auto ID = DE.getCustomDiagID(lev, msg);
+    auto DB = DE.Report(SL, ID);
+    if (s1 != nullptr)
+        DB.AddString(s1);
+    if (s2 != nullptr)
+        DB.AddString(s2);
+    if (s3 != nullptr)
+        DB.AddString(s3);
+}
 
 bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx);
 bool eval_stmt(const Stmt *S, Eval_state &state, ASTContext &ASTctx);
@@ -97,7 +83,6 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
     result.val = std::nullopt;
 
     if (state.block_expr_state.find(E) != state.block_expr_state.end()) {
-        // DEBUG_OUT << " trying to eval twice.. " << loc_str(E) << "\n";
         // we have already evaluated this expression
         result.val = state.block_expr_state[E];
         return true;
@@ -141,8 +126,9 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         }
 
         if (state.vars.find(VD) == state.vars.end()) {
-            INTERNAL_NOTE << " the variable has an unknown value " << loc_str(DRE) << "\n";
-            diags << "             : VarDecl " << loc_str(VD) << " " << VD << "\n";
+
+            INTERNAL_NOTE_IF(E) << " the variable has an unknown value " << loc_str(DRE) << "\n"
+                                << "             : VarDecl " << loc_str(VD) << " " << VD << "\n";
             goto successful_return;
         }
         result.val = state.vars[VD];
@@ -155,10 +141,11 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             // TODO: for now LHS has to be a simple VarRefDecl
             const auto *dreLHS = dyn_cast<DeclRefExpr>(LHS->IgnoreParenImpCasts());
             if (!dreLHS) {
-                INTERNAL_NOTE
+
+                INTERNAL_NOTE_IF(E)
                     << "Only evaluating assignments if LHS is DeclRefExpr: Here it is instead `"
-                    << LHS->IgnoreParenBaseCasts()->getStmtClassName() << "` Not evaluating. " << loc_str(LHS)
-                    << "\n";
+                    << LHS->IgnoreParenBaseCasts()->getStmtClassName() << "` Not evaluating. "
+                    << loc_str(LHS) << "\n";
                 // TODO: maybe some cases could be evaluated?
                 result.val = std::nullopt;
                 goto successful_return;
@@ -419,8 +406,9 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
 
         bool do_eval = true;
         if (!func->isConstexpr()) {
-            color_msg(diags, BLUE, "INTERNAL NOTE: ")
-                << "Call to a function that is not a constexpr " << loc_str(CE) << "\n";
+
+            INTERNAL_NOTE_IF(E) << "Call to a function that is not a constexpr " << loc_str(CE)
+                                << "\n";
             do_eval = false;
         }
 
@@ -499,8 +487,9 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         }
 
         // TODO(CXXConstructExpr):  ... not trying to eval these for now
-        INTERNAL_NOTE << " Not trying to eval CXXConstructExpr. Ignoring for now "
-                      << loc_str(constructor_expr) << "\n";
+
+        INTERNAL_NOTE_IF(E) << " Not trying to eval CXXConstructExpr. Ignoring for now "
+                            << loc_str(constructor_expr) << "\n";
         goto successful_return;
     } else if (const auto *array_subscript = dyn_cast<ArraySubscriptExpr>(E)) {
         // the LHS[RHS] expressions have to be evaluated since they might affect variables we care
@@ -515,6 +504,7 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             return false;
 
         // TODO: ... not trying to eval these for now
+
         INTERNAL_NOTE << " Not trying to eval ArraySubscriptExpr. Ignoring for now "
                       << loc_str(array_subscript) << "\n";
         goto successful_return;
@@ -530,9 +520,7 @@ successful_return:
     return true;
 }
 
-
 bool eval_stmt(const Stmt *S, Eval_state &state, ASTContext &ASTctx) {
-
 
     if (const auto *CS = dyn_cast<CompoundStmt>(S)) {
         for (const auto s : CS->children()) {
@@ -589,6 +577,322 @@ bool eval_stmt(const Stmt *S, Eval_state &state, ASTContext &ASTctx) {
     return false;
 }
 
+// We depend on the successor ordering defined by CFGBlock, see comment above class CFGBlock in
+// CFG.h in llvm sources
+bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx) {
+    // reset block specific state
+    state.block_expr_state.clear();
+
+    if (state.block_visited.find(&block) == state.block_visited.end())
+        state.block_visited[&block] = 0;
+    if (state.block_visited[&block] > MAX_BLOCK_VISITS)
+        return true;
+    state.block_visited[&block]++;
+
+    // the exit_block is just an empty block signaling that we are done
+    if (&block == state.exit_block)
+        return true;
+
+    const auto *trm_stmt = block.getTerminatorStmt();
+    Eval_result cond_res{};
+    const CFGElement &last_element = *block.rbegin();
+    // Eval all the elements in the block
+    for (const CFGElement &element : block) {
+        if (element.getKind() == CFGElement::Statement) {
+            const auto *stmt = element.castAs<CFGStmt>().getStmt();
+            // If there is a terminator statement the last statement is in most cases the condition
+            // expression that is used to choose which successor to go to
+            if (trm_stmt && &element == &last_element) {
+                if (const auto *E = dyn_cast<Expr>(stmt)) {
+                    if (!eval_expr(cond_res, E, state, ASTctx))
+                        return false;
+                } else {
+                    INTERNAL_ERROR << " Expecting the last element of an block with terminator "
+                                      "stmt to be an expression "
+                                   << loc_str(stmt) << "\n";
+                    return false;
+                }
+            } else {
+                if (!eval_stmt(stmt, state, ASTctx))
+                    return false;
+            }
+        } else {
+            INTERNAL_ERROR << " TODO: Unhandled CFGElement Kind: " << element.getKind() << "\n";
+            return false;
+        }
+    }
+
+#if 0
+    const Expr *cond = nullptr;
+    if (trm_stmt) {
+        if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
+            // Handles short circuiting
+            if (BO->getOpcode() == BO_LAnd || BO->getOpcode() == BO_LOr) {
+                DEBUG_OUT << " BO terminator statement ´" << BO->getOpcodeStr() << "` "
+                          << loc_str(BO) << "\n";
+                cond = BO; // the condition is the value of the BinaryOperator itself.
+            } else {
+                INTERNAL_ERROR << " Unhandeled BO terminator statement ´" << BO->getOpcodeStr()
+                               << "` \n";
+                return false;
+            }
+
+        } else if (const auto *CS = dyn_cast<ConditionalOperator>(trm_stmt)) {
+            // this handles the ternary operator: cond ? true_case : false_case;
+            INTERNAL_ERROR << " ConditionalOperator is not implemented yet, and thus no ternary "
+                              "operators can be analysed"
+                           << loc_str(CS) << "\n";
+            return false;
+            // clang-format off
+        // TODO: these are a bit of a pain, since the generated CFG 
+        // for e.g. `res = x ? 1 : 0` looks like:
+        // - block[4]  : 
+        //             : element: <other elements>
+        //             : element:  `x` [Terminator Stmt] : ConditionalOperator
+        //             :  -> succ[0] = block[2]
+        //             :  -> succ[1] = block[3]
+        // ------------------------------
+        // - block[2]  : 
+        //             : element:  `1`
+        //             :  -> succ[0] = block[1]
+        // ------------------------------
+        // - block[3]  : 
+        //             : element:  `0`
+        //             :  -> succ[0] = block[1]
+        // ------------------------------
+        // - block[1]  : 
+        //             : element:  `x ? 1 : 0`
+        //             : element:  ` res = x ? 1 : 0
+        //             :  -> succ[0] = block[0]
+        // ? So we would need to add some functionality so that blocks can return a value,
+        //   and ignore ConditionalOperators as we evaluate the Expr recursively...
+        //   Or figure out something else..
+            // clang-format on
+        }
+    }
+#endif
+
+    // Now based on the terminatorStmt result pick which block we go to
+    auto succ = block.succ_begin();
+    if (trm_stmt == nullptr // if no terminator statement or terminator is one of these:
+        || dyn_cast<BreakStmt>(trm_stmt) // break, continue, goto we should have only one successor
+        || dyn_cast<ContinueStmt>(trm_stmt) //
+        || dyn_cast<GotoStmt>(trm_stmt)     //
+    ) {
+        if (block.succ_empty()) {
+            // we have reached an early return
+            return true;
+        }
+        if (block.succ_size() != 1) {
+            INTERNAL_ERROR << " Expected block[" << block.getBlockID()
+                           << "] to have 1 successors but it has succ_size " << block.succ_size()
+                           << " terminator StmtClass: `" << trm_stmt->getStmtClassName() << "` \n";
+            if (block.Elements.size() > 0)
+                block.Elements.begin()->dump();
+        }
+        CFGBlock *s0 = succ[0]; // this is a cast, succ[0] is actually an AdjacentBlock
+        return eval_CFG_block(*s0, state, ASTctx);
+    } else if (dyn_cast<IfStmt>(trm_stmt)       //
+               || dyn_cast<ForStmt>(trm_stmt)   //
+               || dyn_cast<WhileStmt>(trm_stmt) //
+               || dyn_cast<DoStmt>(trm_stmt)    //
+    ) {
+        if (block.succ_size() != 2) {
+            INTERNAL_ERROR << "ERROR: Expected block[" << block.getBlockID()
+                           << "] to have 2 successors but it has succ_size " << block.succ_size()
+                           << " terminator StmtClass: `" << trm_stmt->getStmtClassName() << "` \n";
+            return false;
+        }
+        CFGBlock *true_branch = succ[0];
+        CFGBlock *false_branch = succ[1];
+
+        if (!cond_res.val.has_value()) {
+            INTERNAL_ERROR << "Could not determine the value of the condition. "
+                              "Cant follow the control flow correctly. Giving up. "
+                           << loc_str(trm_stmt) << "\n";
+            // Report relevant error for the user
+            report_diag(ASTctx, DiagnosticsEngine::Level::Error,
+                        trm_stmt->getSourceRange().getBegin(),
+                        "Could not determine the value of the condition. Cant follow the control "
+                        "flow correctly. Giving up.");
+            return false;
+        }
+        if (cond_res.val.value()) {
+            return eval_CFG_block(*true_branch, state, ASTctx);
+        } else {
+            return eval_CFG_block(*false_branch, state, ASTctx);
+        }
+        // TODO:
+        //} else if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
+        //    if (block.succ_size() != 2) {
+        //        INTERNAL_ERROR << "ERROR: Expected block[" << block.getBlockID()
+        //                       << "] to have 2 successors but it has succ_size " <<
+        //                       block.succ_size()
+        //                       << " terminator StmtClass: `BinaryOperator` \n";
+        //        return false;
+        //    }
+        //    // if BinaryOperator || or && :
+        //    // true_branch = short circuit branch,
+        //    // false_branch= RHS of the binop
+
+    } else if (const auto *SWITCH = dyn_cast<SwitchStmt>(trm_stmt)) {
+        // switch statement needs special handling
+        // has as many successor as there are cases (+1 if there is no default case present)
+
+        CFGBlock *default_block = block.succ_end()[-1];
+        for (auto it = block.succ_begin(); it != block.succ_end(); it++) {
+            const CFGBlock *case_block = *it;
+            auto case_label_stmt = case_block->getLabel();
+            if (case_label_stmt == nullptr) {
+                // this is hit if there is no `default:` in the source code
+            } else if (auto cs = dyn_cast<CaseStmt>(case_label_stmt)) {
+
+                auto case_val_expr = cs->getLHS();
+                Expr::EvalResult result;
+                if (!case_val_expr->EvaluateAsConstantExpr(result, ASTctx)) {
+                    // probably not valid c++ and should not happen
+                    INTERNAL_ERROR << " the case label is not an constant expression"
+                                   << loc_str(case_val_expr) << "\n";
+                    return false;
+                }
+                uint64_t case_val = result.Val.getInt().getExtValue();
+                if (!cond_res.val.has_value()) {
+                    INTERNAL_ERROR << " Could not determine the value of the switch variable. "
+                                      "Cant follow the control flow correctly. Giving up. "
+                                   << loc_str(trm_stmt) << "\n";
+                    // Report relevant error for the user
+                    report_diag(ASTctx, DiagnosticsEngine::Level::Error,
+                                trm_stmt->getSourceRange().getBegin(),
+                                " Could not determine the value of the switch variable. "
+                                "Cant follow the control flow correctly. Giving up. ");
+                    return false;
+                }
+                if ((uint64_t)cond_res.val.value() == case_val) {
+                    return eval_CFG_block(*case_block, state, ASTctx);
+                }
+
+            } else if (auto _ = dyn_cast<DefaultStmt>(case_label_stmt)) {
+                // do nothing
+            } else {
+                INTERNAL_ERROR
+                    << " case is not CaseStmt or DefaultStmt or null, should be unreachable\n ";
+                return false;
+            }
+        }
+        //  Nothing has matched: eval default
+        return eval_CFG_block(*default_block, state, ASTctx);
+        //    } else if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
+
+    } else {
+        INTERNAL_ERROR << " TODO: Unhandeled terminatorStmt class " << loc_str(trm_stmt) << " : "
+                       << trm_stmt->getStmtClassName() << "\n";
+        return false;
+    }
+
+    // Should be unreachable
+    INTERNAL_ERROR << " Something unhandeled eval_CFG_block fell through\n";
+    return false;
+}
+
+bool Idx_expr_evaluator::init(const FunctionDecl *func, Stmt *statement_in_the_func,
+                              ASTContext *ctx) {
+    assert(func != nullptr);
+    assert(statement_in_the_func != nullptr);
+
+    CFG::BuildOptions CFG_opts;
+    cfg = CFG::buildCFG(func, statement_in_the_func, ctx, CFG_opts);
+
+    if (!cfg) {
+        ASTContext &ASTctx = *ctx;
+        INTERNAL_ERROR << " Could not build a CFG for statement starting at "
+                       << loc_str(statement_in_the_func) << "\n"
+                       << "               : The supplied FunctionDecl is at " << loc_str(func)
+                       << "\n";
+        return false;
+    }
+    ASTctx = ctx;
+    main_entry_block = &cfg->getEntry();
+    main_exit_block = &cfg->getExit();
+    main_state.exit_block = main_exit_block;
+
+    diags.enable_colors(true);
+    reported_diag.clear();
+
+    return true;
+}
+
+void Idx_expr_evaluator::add_expr_to_tracking_list(const Expr *E) {
+    main_state.possible_vals_for_expr[E] = {}; // init as empty set
+}
+
+bool Idx_expr_evaluator::exec() {
+    assert(main_entry_block != nullptr);
+    return eval_CFG_block(*main_entry_block, main_state, *ASTctx);
+}
+
+std::pair<const Value_set *, bool> Idx_expr_evaluator::get_vals_for_expr(Expr *E) const {
+
+    auto it = main_state.possible_vals_for_expr.find(E);
+    if (it == main_state.possible_vals_for_expr.end())
+        return {nullptr, false};
+
+    const Value_set *ret;
+    ret = &(it->second);
+
+    if (it->second.find(std::nullopt) != it->second.end())
+        return {ret, false};
+
+    return {ret, true};
+}
+
+void Idx_expr_evaluator::print_vals_for_expr(llvm::raw_ostream &os, Expr *E) const {
+    const auto pair = get_vals_for_expr(E);
+    const auto *vals = pair.first;
+    bool ok = pair.second;
+    if (!vals) {
+        os << "NO EXPR FOUND: " << "print_vals_for_expr: no expr in possible_vals_for_expr: "
+           << loc_strp(E) << "\n";
+        return;
+    }
+    if (!ok) {
+        os << "NOTE: Could not track the Expr: ";
+    }
+    os << loc_strp(E) << " Expr = [ ";
+    for (auto val : *vals) {
+        os << val << ", ";
+    }
+    os << " ]\n";
+}
+
+void Idx_expr_evaluator::print_all_vals_vars(llvm::raw_ostream &os) const {
+    for (auto var_vals : main_state.all_possible_vals) {
+        os << loc_strp(var_vals.first) << " `" << var_vals.first->getNameAsString() << "` = [ ";
+        for (auto val : var_vals.second) {
+            os << val << ", ";
+        }
+        os << " ]\n";
+    }
+}
+
+void Idx_expr_evaluator::print_all_vals_exprs(llvm::raw_ostream &os) const {
+    for (auto expr_vals : main_state.possible_vals_for_expr) {
+        os << loc_strp(expr_vals.first) << " = [ ";
+        for (auto val : expr_vals.second) {
+            os << val << ", ";
+        }
+        os << " ]\n";
+    }
+}
+
+void Idx_expr_evaluator::print_eval_diags(llvm::raw_ostream &os) const {
+    os << diag_msg;
+}
+
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// Misc debug helpers
+#define BRED_STR(str) "\033[41m" str "\033[0m"
+#define RED_STR(str) "\033[0;31m" str "\033[0m"
 bool debug_print_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx) {
     bool ret = true; // set this to false if we encounter something we don't handle
 
@@ -712,338 +1016,3 @@ bool debug_print_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext 
     }
     return ret;
 }
-
-// We depend on the successor ordering defined by CFGBlock, see comment above class CFGBlock in
-// CFG.h in llvm sources
-bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx) {
-    // reset block specific state
-    state.block_expr_state.clear();
-
-    if (state.block_visited.find(&block) == state.block_visited.end())
-        state.block_visited[&block] = 0;
-    if (state.block_visited[&block] > MAX_BLOCK_VISITS)
-        return true;
-    state.block_visited[&block]++;
-
-    // the exit_block is just an empty block signaling that we are done
-    if (&block == state.exit_block)
-        return true;
-
-    const auto *trm_stmt = block.getTerminatorStmt();
-    Eval_result cond_res{};
-    const CFGElement &last_element = *block.rbegin();
-    // Eval all the elements in the block
-    for (const CFGElement &element : block) {
-        if (element.getKind() == CFGElement::Statement) {
-            const auto *stmt = element.castAs<CFGStmt>().getStmt();
-            // If there is a terminator statement the last statement is in most cases the condition
-            // expression that is used to choose which successor to go to
-            if (trm_stmt && &element == &last_element) {
-                if (const auto *E = dyn_cast<Expr>(stmt)) {
-                    if (!eval_expr(cond_res, E, state, ASTctx))
-                        return false;
-                    //DEBUG_OUT << " cond_res " << cond_res.val << " " << loc_str(E) << " "
-                    //          << E->getStmtClassName() << "\n";
-                } else {
-                    INTERNAL_ERROR << " Expecting the last element of an block with terminator "
-                                      "stmt to be an expression "
-                                   << loc_str(stmt) << "\n";
-                    return false;
-                }
-            } else {
-                if (!eval_stmt(stmt, state, ASTctx))
-                    return false;
-            }
-        } else {
-            INTERNAL_ERROR << " TODO: Unhandled CFGElement Kind: " << element.getKind() << "\n";
-            return false;
-        }
-    }
-
-#if 0
-    const Expr *cond = nullptr;
-    if (trm_stmt) {
-        if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
-            // Handles short circuiting
-            if (BO->getOpcode() == BO_LAnd || BO->getOpcode() == BO_LOr) {
-                DEBUG_OUT << " BO terminator statement ´" << BO->getOpcodeStr() << "` "
-                          << loc_str(BO) << "\n";
-                cond = BO; // the condition is the value of the BinaryOperator itself.
-            } else {
-                INTERNAL_ERROR << " Unhandeled BO terminator statement ´" << BO->getOpcodeStr()
-                               << "` \n";
-                return false;
-            }
-
-        } else if (const auto *CS = dyn_cast<ConditionalOperator>(trm_stmt)) {
-            // this handles the ternary operator: cond ? true_case : false_case;
-            INTERNAL_ERROR << " ConditionalOperator is not implemented yet, and thus no ternary "
-                              "operators can be analysed"
-                           << loc_str(CS) << "\n";
-            return false;
-            // clang-format off
-        // TODO: these are a bit of a pain, since the generated CFG 
-        // for e.g. `res = x ? 1 : 0` looks like:
-        // - block[4]  : 
-        //             : element: <other elements>
-        //             : element:  `x` [Terminator Stmt] : ConditionalOperator
-        //             :  -> succ[0] = block[2]
-        //             :  -> succ[1] = block[3]
-        // ------------------------------
-        // - block[2]  : 
-        //             : element:  `1`
-        //             :  -> succ[0] = block[1]
-        // ------------------------------
-        // - block[3]  : 
-        //             : element:  `0`
-        //             :  -> succ[0] = block[1]
-        // ------------------------------
-        // - block[1]  : 
-        //             : element:  `x ? 1 : 0`
-        //             : element:  ` res = x ? 1 : 0
-        //             :  -> succ[0] = block[0]
-        // ? So we would need to add some functionality so that blocks can return a value,
-        //   and ignore ConditionalOperators as we evaluate the Expr recursively...
-        //   Or figure out something else..
-            // clang-format on
-        }
-    }
-#endif
-
-    // Now based on the terminatorStmt result pick which block we go to
-    auto succ = block.succ_begin();
-    if (trm_stmt == nullptr // if no terminator statement or terminator is one of these:
-        || dyn_cast<BreakStmt>(trm_stmt) // break, continue, goto we should have only one successor
-        || dyn_cast<ContinueStmt>(trm_stmt) //
-        || dyn_cast<GotoStmt>(trm_stmt)     //
-    ) {
-        if (block.succ_empty()) {
-            // we have reached an early return
-            return true;
-        }
-        if (block.succ_size() != 1) {
-            INTERNAL_ERROR << " Expected block[" << block.getBlockID()
-                           << "] to have 1 successors but it has succ_size " << block.succ_size()
-                           << " terminator StmtClass: `" << trm_stmt->getStmtClassName() << "` \n";
-            if (block.Elements.size() > 0)
-                block.Elements.begin()->dump();
-        }
-        CFGBlock *s0 = succ[0]; // this is a cast, succ[0] is actually an AdjacentBlock
-        return eval_CFG_block(*s0, state, ASTctx);
-    } else if (dyn_cast<IfStmt>(trm_stmt)       //
-               || dyn_cast<ForStmt>(trm_stmt)   //
-               || dyn_cast<WhileStmt>(trm_stmt) //
-               || dyn_cast<DoStmt>(trm_stmt)    //
-    ) {
-        if (block.succ_size() != 2) {
-            INTERNAL_ERROR << "ERROR: Expected block[" << block.getBlockID()
-                           << "] to have 2 successors but it has succ_size " << block.succ_size()
-                           << " terminator StmtClass: `" << trm_stmt->getStmtClassName() << "` \n";
-            return false;
-        }
-        CFGBlock *true_branch = succ[0];
-        CFGBlock *false_branch = succ[1];
-        // This might be a redundant check..
-        if (!cond_res.val.has_value()) {
-            // TODO: this might be relevant error for the user
-            INTERNAL_ERROR << " 2 Could not determine the value of the condition. "
-                              "Cant follow the control flow correctly. Giving up. "
-                           << loc_str(trm_stmt) << "\n";
-            return false;
-        }
-        if (cond_res.val.value()) {
-            return eval_CFG_block(*true_branch, state, ASTctx);
-        } else {
-            return eval_CFG_block(*false_branch, state, ASTctx);
-        }
-        // TODO:
-        //} else if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
-        //    if (block.succ_size() != 2) {
-        //        INTERNAL_ERROR << "ERROR: Expected block[" << block.getBlockID()
-        //                       << "] to have 2 successors but it has succ_size " <<
-        //                       block.succ_size()
-        //                       << " terminator StmtClass: `BinaryOperator` \n";
-        //        return false;
-        //    }
-        //    // if BinaryOperator || or && :
-        //    // true_branch = short circuit branch,
-        //    // false_branch= RHS of the binop
-
-    } else if (const auto *SWITCH = dyn_cast<SwitchStmt>(trm_stmt)) {
-        // switch statement needs special handling
-        // has as many successor as there are cases (+1 if there is no default case present)
-
-        CFGBlock *default_block = block.succ_end()[-1];
-        for (auto it = block.succ_begin(); it != block.succ_end(); it++) {
-            const CFGBlock *case_block = *it;
-            auto case_label_stmt = case_block->getLabel();
-            if (case_label_stmt == nullptr) {
-                // this is hit if there is no `default:` in the source code
-            } else if (auto cs = dyn_cast<CaseStmt>(case_label_stmt)) {
-
-                auto case_val_expr = cs->getLHS();
-                Expr::EvalResult result;
-                if (!case_val_expr->EvaluateAsConstantExpr(result, ASTctx)) {
-                    // probably not valid c++ and should not happen
-                    INTERNAL_ERROR << " the case label is not an constant expression"
-                                   << loc_str(case_val_expr) << "\n";
-                    return false;
-                }
-                uint64_t case_val = result.Val.getInt().getExtValue();
-                if (!cond_res.val.has_value()) {
-                    // TODO: this might be relevant error for the user
-                    INTERNAL_ERROR << " Could not determine the value of the switch variable. "
-                                      "Cant follow the control flow correctly. Giving up. "
-                                   << loc_str(trm_stmt) << "\n";
-                    return false;
-                }
-                if ((uint64_t)cond_res.val.value() == case_val) {
-                    return eval_CFG_block(*case_block, state, ASTctx);
-                }
-
-            } else if (auto _ = dyn_cast<DefaultStmt>(case_label_stmt)) {
-                // do nothing
-            } else {
-                INTERNAL_ERROR
-                    << " case is not CaseStmt or DefaultStmt or null, should be unreachable\n ";
-                return false;
-            }
-        }
-        //  Nothing has matched: eval default
-        return eval_CFG_block(*default_block, state, ASTctx);
-        //    } else if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
-
-    } else {
-        INTERNAL_ERROR << " TODO: Unhandeled terminatorStmt class " << loc_str(trm_stmt) << " : "
-                       << trm_stmt->getStmtClassName() << "\n";
-        return false;
-    }
-
-    // Should be unreachable
-    INTERNAL_ERROR << " Something unhandeled eval_CFG_block fell through\n";
-    return false;
-}
-
-
-bool Idx_expr_evaluator::init(const FunctionDecl *func, Stmt *statement_in_the_func,
-                              ASTContext *ctx) {
-    assert(func != nullptr);
-    assert(statement_in_the_func != nullptr);
-
-    CFG::BuildOptions CFG_opts;
-    cfg = CFG::buildCFG(func, statement_in_the_func, ctx, CFG_opts);
-
-    if (!cfg) {
-        ASTContext &ASTctx = *ctx;
-        INTERNAL_ERROR << " Could not build a CFG for statement starting at "
-                       << loc_str(statement_in_the_func) << "\n";
-        diags << "               : The supplied FunctionDecl is at " << loc_str(func) << "\n";
-        return false;
-    }
-    ASTctx = ctx;
-    main_entry_block = &cfg->getEntry();
-    main_exit_block = &cfg->getExit();
-    main_state.exit_block = main_exit_block;
-
-    diags.enable_colors(true);
-
-    return true;
-}
-
-void Idx_expr_evaluator::add_expr_to_tracking_list(const Expr *E) {
-    main_state.possible_vals_for_expr[E] = {}; // init as empty set
-}
-
-bool Idx_expr_evaluator::exec() {
-    assert(main_entry_block != nullptr);
-    return eval_CFG_block(*main_entry_block, main_state, *ASTctx);
-}
-
-// bool Idx_expr_evaluator::get_possible_vals_for_expr(Expr *E, const
-// std::set<std::optional<int64_t>> &vals) const {}
-
-void Idx_expr_evaluator::print_eval_diags(llvm::raw_ostream &os) {
-    os << diag_msg;
-};
-
-#if 0
-// Testing
-using namespace clang::ast_matchers;
-class FunctionAnalyzer : public MatchFinder::MatchCallback {
-    //    const ArraySubscriptExpr *expr_to_track = nullptr;
-  public:
-    // Testing:
-    void run(const MatchFinder::MatchResult &Result) override {
-        diags.enable_colors(true);
-        ASTContext &ASTctx = *Result.Context;
-        Eval_state state;
-
-        // the function we analyse for testing:
-        const FunctionDecl *Func = Result.Nodes.getNodeAs<FunctionDecl>("func");
-        if (!Func || !Func->hasBody()) return;
-        llvm::errs() << "Found function `test`\n";
-        auto *FB = Func->getBody();
-
-        // flag the expr we care about
-        auto matcher = stmt(hasDescendant(arraySubscriptExpr().bind("arrayAccess")));
-        auto Results = match(matcher, *FB, ASTctx);
-        if (!Results.empty()) {
-            const BoundNodes &Nodes = Results[0];
-            const auto *arr_acc = Nodes.getNodeAs<ArraySubscriptExpr>("arrayAccess");
-            llvm::outs() << "Found array subscript expr: " << loc_str(arr_acc) << "\n";
-        } else {
-            llvm::outs() << "No array subscript exprs.... \n";
-        }
-
-        CFG::BuildOptions CFG_BO;
-        auto CFG = CFG::buildCFG(Func, FB, &ASTctx, CFG_BO);
-        auto entry_block = CFG->getEntry();
-        auto exit_block = CFG->getExit();
-        state.exit_block = &exit_block;
-        state.exit_block->dump();
-
-        Eval_state state_print;
-        debug_print_CFG_block(entry_block, state_print, ASTctx);
-
-        if (!Results.empty()) {
-            auto *arr_acc = Results[0].getNodeAs<ArraySubscriptExpr>("arrayAccess");
-            auto idx_expr = arr_acc->getRHS();
-            state.possible_vals_for_expr[idx_expr] = {}; // init as empty set
-        }
-
-        bool ret = eval_CFG_block(entry_block, state, ASTctx);
-        llvm::outs() << "eval_CFG_block " << (ret ? "true" : "false") << "\n";
-
-        llvm::outs() << "------- state.all_possible_vals -------\n";
-        for (auto var_vals : state.all_possible_vals) {
-            llvm::outs() << loc_str(var_vals.first) << " `" << var_vals.first->getNameAsString()
-                         << "` = [ ";
-            for (auto val : var_vals.second) { llvm::outs() << val << ", "; }
-            llvm::outs() << " ]\n";
-        }
-
-        llvm::outs() << "------- state.possible_vals_for_expr -------\n";
-        for (auto expr_vals : state.possible_vals_for_expr) {
-            llvm::outs() << loc_str(expr_vals.first) << " = [ ";
-            for (auto val : expr_vals.second) { llvm::outs() << val << ", "; }
-            llvm::outs() << " ]\n";
-        }
-
-        llvm::outs() << diag_msg;
-
-    }
-};
-
-static cl::OptionCategory LoopVarTrackerOpts("LoopVarTrackerOpts options");
-
-int main(int argc, const char **argv) {
-    auto OptionsParser = CommonOptionsParser::create(argc, argv, LoopVarTrackerOpts);
-    if (!OptionsParser) { exit(1); }
-    auto &optParser = OptionsParser.get();
-    ClangTool Tool(optParser.getCompilations(), optParser.getSourcePathList());
-    FunctionAnalyzer Analyzer;
-    MatchFinder Finder;
-    Finder.addMatcher(functionDecl(hasName("test")).bind("func"), &Analyzer);
-    return Tool.run(newFrontendActionFactory(&Finder).get());
-}
-#endif
