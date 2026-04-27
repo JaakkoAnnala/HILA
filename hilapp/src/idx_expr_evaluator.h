@@ -18,8 +18,7 @@
 
 // TODO: check llvm version requirement...
 
-// TODO: logical and &&, logical or ||, ternary statement x ? y : z NOT IMPLEMENTED YET. A bit
-// tricky due to how CFG is layed out...
+// TODO: ternary statement x ? y : z NOT IMPLEMENTED YET.
 
 // TODO: At the moment we give up every time that we encounter a control flow that we cannot
 // determine which branch to take. However, if we only care about for example ´x´ in:
@@ -44,6 +43,10 @@ using namespace clang;
 
 using Value_set = std::set<std::optional<int64_t>>;
 
+struct Eval_result {
+    std::optional<int64_t> val = std::nullopt;
+};
+
 struct Eval_state {
 
     ////////////////////////////////////////////
@@ -57,6 +60,9 @@ struct Eval_state {
     // If the value could not be evaluated, or the function does not return anything
     // return_val is nullopt.
     std::optional<int64_t> return_val = std::nullopt;
+
+    // Store the last evaluated expr used for short circuiting in (x?a:b) , || , && expressions.
+    Eval_result last_res{};
 
     std::unordered_map<const Expr *, std::optional<int64_t>> block_expr_state;
 
@@ -79,9 +85,6 @@ struct Eval_state {
     std::unordered_map<const VarDecl *, Value_set> all_possible_vals;
 };
 
-struct Eval_result {
-    std::optional<int64_t> val = std::nullopt;
-};
 
 struct Idx_expr_evaluator {
 
@@ -101,7 +104,6 @@ struct Idx_expr_evaluator {
      * note: Empty set is a valid return.
      */
     std::pair<const Value_set *, bool> get_vals_for_expr(Expr *E) const;
-
 
 
     void print_vals_for_expr(llvm::raw_ostream &os, Expr *E) const;
