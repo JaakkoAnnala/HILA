@@ -19,6 +19,8 @@ using namespace clang::ast_matchers;
 /////////////////////////////////////////////////////////////////
 // Setup stuff for tests
 
+bool g_print_results = false;
+
 class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
   public:
     Idx_expr_evaluator evaluator{};
@@ -157,6 +159,9 @@ inline bool compare_var_expect(std::string var_name, TrackedVar<T> &var_expected
             test_pass = false;                                                                     \
             color_msg(llvm::outs(), RED, "Results differ for var ", true, __FILE__, __LINE__)      \
                 << "`" #VAR "`\n";                                                                 \
+            print_var_result(#VAR);                                                                \
+            print_var_expect(VAR);                                                                 \
+        } else if (g_print_results) {                                                              \
             print_var_result(#VAR);                                                                \
             print_var_expect(VAR);                                                                 \
         }                                                                                          \
@@ -693,6 +698,108 @@ test_basic_goto_label_1:
     TEST_CASE_END;
 }
 
+bool test_basic_LOr() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Our ast_eval it
+    TEST_EVAL_STRING_CSTMT(R"(
+    int a = 11;
+    int i = 0;
+    int c = 0;
+    a = i || ++i;
+    if(a) c++;
+    a = i || ++i;
+    if(a) c++;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it 
+    TrackedVar<int> a = 11;
+    TrackedVar<int> i = 0;
+    TrackedVar<int> c = 0;
+    a = i || ++i;
+    if(a) c++;
+    a = i || ++i;
+    if(a) c++;
+    // clang-format on
+    /////////////////////////////////////////////
+    // Compare results
+    COMPARE_AND_SET_TEST_PASS(a);
+    COMPARE_AND_SET_TEST_PASS(i);
+    COMPARE_AND_SET_TEST_PASS(c);
+
+    TEST_CASE_END;
+}
+
+bool test_basic_LAnd() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Our ast_eval it
+    TEST_EVAL_STRING_CSTMT(R"(
+    int a = 123;
+    int i = 0;
+    int c = 0;
+    a = (++i && ++i);
+    if(a) c++;
+    a = ( (i-2) && ++i);
+    if(a) c++;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it 
+    TrackedVar<int> a = 123;
+    TrackedVar<int> i = 0;
+    TrackedVar<int> c = 0;
+    a = (++i && ++i);
+    if(a) c++;
+    a = ( (i-2) && ++i);
+    if(a) c++;
+    // clang-format on
+    /////////////////////////////////////////////
+    // Compare results
+    COMPARE_AND_SET_TEST_PASS(a);
+    COMPARE_AND_SET_TEST_PASS(i);
+    COMPARE_AND_SET_TEST_PASS(c);
+
+    TEST_CASE_END;
+}
+
+bool test_basic_LAnd_LOr() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Our ast_eval it
+    TEST_EVAL_STRING_CSTMT(R"(
+    int x = 123;
+    int a = 10;
+    int i = 0;
+    int c = 0;
+    a = ( !(x && ++i) || (++i && a) ) && ++i;
+    if(a) c++;
+    a = (x++ && (x-123)) && ( (x=0) && ++i );
+    if(a) c++;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it 
+    TrackedVar<int> x = 123;
+    TrackedVar<int> a = 10;
+    TrackedVar<int> i = 0;
+    TrackedVar<int> c = 0;
+    a = ( !(x && ++i) || (++i && a) ) && ++i;
+    if(a) c++;
+    a = (x++ && (x-123)) && ( (x=0) && ++i );
+    if(a) c++;
+    // clang-format on
+    /////////////////////////////////////////////
+    // Compare results
+    COMPARE_AND_SET_TEST_PASS(x);
+    COMPARE_AND_SET_TEST_PASS(a);
+    COMPARE_AND_SET_TEST_PASS(i);
+    COMPARE_AND_SET_TEST_PASS(c);
+
+    TEST_CASE_END;
+}
+
 bool test_lots_of_control_flow_things_1() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -744,6 +851,58 @@ bool test_lots_of_control_flow_things_1() {
     TEST_CASE_END;
 }
 
+bool test_lots_of_control_flow_things_2() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Our ast_eval it
+    TEST_EVAL_STRING_CSTMT(R"(
+    int i = 0;
+    int sum = 0;
+    int i2 = 0;
+    for(i = 1; i < 100; ++i){
+        if(i % 2 == 0 || i % 3 == 0) sum += i;
+        if(sum == 3){
+            while(i2 < 10 + i){
+                sum -= i2;
+                if(i2 > 8 && i > 10) break;
+                i2++;
+            }
+        }
+        if(i%3 == 0) continue;
+        else sum += 1;
+        sum += 1;
+        if(sum > 2000 && i%5==0) sum += 10000;
+    }
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it 
+    TrackedVar<int> i = 0;
+    TrackedVar<int> sum = 0;
+    TrackedVar<int> i2 = 0;
+    for(i = 1; i < 100; ++i){
+        if(i % 2 == 0 || i % 3 == 0) sum += i;
+        if(sum == 3){
+            while(i2 < 10 + i){
+                sum -= i2;
+                if(i2 > 8 && i > 10) break;
+                i2++;
+            }
+        }
+        if(i%3 == 0) continue;
+        else sum += 1;
+        sum += 1;
+        if(sum > 2000 && i%5==0) sum += 10000;
+    }
+    // clang-format on
+    /////////////////////////////////////////////
+    // Compare results
+    COMPARE_AND_SET_TEST_PASS(i);
+    COMPARE_AND_SET_TEST_PASS(sum);
+    COMPARE_AND_SET_TEST_PASS(i2);
+
+    TEST_CASE_END;
+}
 
 bool test_constexpr_func() {
     TEST_CASE_BEGIN;
@@ -850,8 +1009,15 @@ static std::vector<test_func> test_cases = {
     // goto
     test_basic_goto,
 
+    // LOr, LAnd
+    test_basic_LOr,
+    test_basic_LAnd,
+    test_basic_LAnd_LOr,
+
     //
     test_lots_of_control_flow_things_1,
+    test_lots_of_control_flow_things_2,
+
 
     // calling constexpr functions
     test_constexpr_func,
@@ -864,7 +1030,10 @@ static std::vector<test_func> test_cases = {
     // clang-format on
 };
 
-int main() {
+int main(int argc, char **argv) {
+    (void)argv; // Unused
+    if (argc > 1)
+        g_print_results = true;
 
     int n_failed = 0;
     for (auto test_case : test_cases) {
