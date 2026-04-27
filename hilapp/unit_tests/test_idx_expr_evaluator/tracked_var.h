@@ -39,6 +39,8 @@ class TrackedVar {
     DEF_BOP_THAT_ASSIGNS(^=)
     DEF_BOP_THAT_ASSIGNS(|=)
 
+#undef DEF_BOP_THAT_ASSIGNS
+
     // pre inc/dec
     T operator++() {
         T ret = ++val;
