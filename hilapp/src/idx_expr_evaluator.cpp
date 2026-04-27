@@ -85,6 +85,7 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
     if (state.block_expr_state.find(E) != state.block_expr_state.end()) {
         // we have already evaluated this expression
         result.val = state.block_expr_state[E];
+        state.last_res = result;
         return true;
     }
 
@@ -207,10 +208,19 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
                 return false;
             }
         } else {
-            // TODO: !!! check c++ specs if the order of evaluation is defined... LHS evaluated
-            // first
             auto op = BO->getOpcode();
+            // special cases || and && are handeled on the level of CFG blocks,
+            // not evaluated recursively.
+            // ASSUMPTION: assumes the CFGBlock's are layed out as in LLVM(21.1.8), i.e. LAnd/LOr
+            // are preceded by the last relevant boolean expression.
+            //// [C99 6.5.13] Logical AND operator.
+            //// [C99 6.5.14] Logical OR operator.
+            if (op == BO_LAnd || op == BO_LOr) {
+                result.val = state.last_res.val.value();
+                goto successful_return;
+            }
 
+            // LHS evaluated first
             Eval_result lhs_res{};
             if (!eval_expr(lhs_res, LHS, state, ASTctx))
                 return false;
@@ -218,30 +228,6 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
                 goto successful_return; // We dont know the values just return the nullopt
 
             Eval_result rhs_res{};
-            // special cases || and &&
-            if (op == BO_LAnd) {
-                //// [C99 6.5.13] Logical AND operator.
-                // eval rhs only if lhs is true
-                if (lhs_res.val) {
-                    if (!eval_expr(rhs_res, RHS, state, ASTctx))
-                        return false;
-                    result.val = lhs_res.val.value() && rhs_res.val.value();
-                } else {
-                    result.val = lhs_res.val.value();
-                }
-                goto successful_return;
-            } else if (op == BO_LOr) {
-                //// [C99 6.5.14] Logical OR operator.
-                // eval rhs only if lhs is false
-                if (!lhs_res.val) {
-                    if (!eval_expr(rhs_res, RHS, state, ASTctx))
-                        return false;
-                    result.val = lhs_res.val.value() || rhs_res.val.value();
-                } else {
-                    result.val = lhs_res.val.value();
-                }
-                goto successful_return;
-            }
 
             if (!eval_expr(rhs_res, RHS, state, ASTctx))
                 return false;
@@ -400,6 +386,13 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         // TODO: Interpret Implicit casts as a nop.. This might not be correct..
         if (!eval_expr(result, IC->IgnoreImpCasts(), state, ASTctx))
             return false;
+
+        if (IC->getCastKind() == CK_IntegralToBoolean) {
+            result.val = (bool)result.val.value();
+        } else {
+            INTERNAL_NOTE << "Ignoring implicit cast " << IC->getCastKindName() << "\n";
+        }
+
         goto successful_return;
     } else if (const auto *CE = dyn_cast<CallExpr>(E)) {
         const auto *func = CE->getDirectCallee();
@@ -517,6 +510,7 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
 successful_return:
     track_expr(result, E, state);
     state.block_expr_state[E] = result.val;
+    state.last_res = result;
     return true;
 }
 
@@ -622,55 +616,6 @@ bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx
         }
     }
 
-#if 0
-    const Expr *cond = nullptr;
-    if (trm_stmt) {
-        if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
-            // Handles short circuiting
-            if (BO->getOpcode() == BO_LAnd || BO->getOpcode() == BO_LOr) {
-                DEBUG_OUT << " BO terminator statement ´" << BO->getOpcodeStr() << "` "
-                          << loc_str(BO) << "\n";
-                cond = BO; // the condition is the value of the BinaryOperator itself.
-            } else {
-                INTERNAL_ERROR << " Unhandeled BO terminator statement ´" << BO->getOpcodeStr()
-                               << "` \n";
-                return false;
-            }
-
-        } else if (const auto *CS = dyn_cast<ConditionalOperator>(trm_stmt)) {
-            // this handles the ternary operator: cond ? true_case : false_case;
-            INTERNAL_ERROR << " ConditionalOperator is not implemented yet, and thus no ternary "
-                              "operators can be analysed"
-                           << loc_str(CS) << "\n";
-            return false;
-            // clang-format off
-        // TODO: these are a bit of a pain, since the generated CFG 
-        // for e.g. `res = x ? 1 : 0` looks like:
-        // - block[4]  : 
-        //             : element: <other elements>
-        //             : element:  `x` [Terminator Stmt] : ConditionalOperator
-        //             :  -> succ[0] = block[2]
-        //             :  -> succ[1] = block[3]
-        // ------------------------------
-        // - block[2]  : 
-        //             : element:  `1`
-        //             :  -> succ[0] = block[1]
-        // ------------------------------
-        // - block[3]  : 
-        //             : element:  `0`
-        //             :  -> succ[0] = block[1]
-        // ------------------------------
-        // - block[1]  : 
-        //             : element:  `x ? 1 : 0`
-        //             : element:  ` res = x ? 1 : 0
-        //             :  -> succ[0] = block[0]
-        // ? So we would need to add some functionality so that blocks can return a value,
-        //   and ignore ConditionalOperators as we evaluate the Expr recursively...
-        //   Or figure out something else..
-            // clang-format on
-        }
-    }
-#endif
 
     // Now based on the terminatorStmt result pick which block we go to
     auto succ = block.succ_begin();
@@ -692,10 +637,11 @@ bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx
         }
         CFGBlock *s0 = succ[0]; // this is a cast, succ[0] is actually an AdjacentBlock
         return eval_CFG_block(*s0, state, ASTctx);
-    } else if (dyn_cast<IfStmt>(trm_stmt)       //
-               || dyn_cast<ForStmt>(trm_stmt)   //
-               || dyn_cast<WhileStmt>(trm_stmt) //
-               || dyn_cast<DoStmt>(trm_stmt)    //
+    } else if (dyn_cast<IfStmt>(trm_stmt)            //
+               || dyn_cast<ForStmt>(trm_stmt)        //
+               || dyn_cast<WhileStmt>(trm_stmt)      //
+               || dyn_cast<DoStmt>(trm_stmt)         //
+               || dyn_cast<BinaryOperator>(trm_stmt) //
     ) {
         if (block.succ_size() != 2) {
             INTERNAL_ERROR << "ERROR: Expected block[" << block.getBlockID()
@@ -703,6 +649,8 @@ bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx
                            << " terminator StmtClass: `" << trm_stmt->getStmtClassName() << "` \n";
             return false;
         }
+
+        // ASSUMPTION: This assumes this order is quaranteed by LLVM
         CFGBlock *true_branch = succ[0];
         CFGBlock *false_branch = succ[1];
 
@@ -717,25 +665,24 @@ bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx
                         "flow correctly. Giving up.");
             return false;
         }
+
+        if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
+            if (!(BO->getOpcode() == BO_LAnd || BO->getOpcode() == BO_LOr)) {
+                // Unreachable
+                INTERNAL_ERROR << "Expected terminator StmtClass: `BinaryOperator` to have Opcode"
+                                  "BO_LAnd or BO_LOr but found "
+                               << BO->getOpcodeStr() << loc_str(trm_stmt) << "\n";
+                return false;
+            }
+        }
+
         if (cond_res.val.value()) {
             return eval_CFG_block(*true_branch, state, ASTctx);
         } else {
             return eval_CFG_block(*false_branch, state, ASTctx);
         }
-        // TODO:
-        //} else if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
-        //    if (block.succ_size() != 2) {
-        //        INTERNAL_ERROR << "ERROR: Expected block[" << block.getBlockID()
-        //                       << "] to have 2 successors but it has succ_size " <<
-        //                       block.succ_size()
-        //                       << " terminator StmtClass: `BinaryOperator` \n";
-        //        return false;
-        //    }
-        //    // if BinaryOperator || or && :
-        //    // true_branch = short circuit branch,
-        //    // false_branch= RHS of the binop
 
-    } else if (const auto *SWITCH = dyn_cast<SwitchStmt>(trm_stmt)) {
+    } else if (dyn_cast<SwitchStmt>(trm_stmt)) {
         // switch statement needs special handling
         // has as many successor as there are cases (+1 if there is no default case present)
 
@@ -781,7 +728,6 @@ bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx
         }
         //  Nothing has matched: eval default
         return eval_CFG_block(*default_block, state, ASTctx);
-        //    } else if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
 
     } else {
         INTERNAL_ERROR << " TODO: Unhandeled terminatorStmt class " << loc_str(trm_stmt) << " : "
@@ -922,7 +868,7 @@ bool debug_print_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext 
             //    cond = CS->getCond();
         } else if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
             is_binaryOperator_LAnd_Lor = true;
-
+            (void)BO; // Unused
         } else if (const auto *BRK = dyn_cast<BreakStmt>(trm_stmt)) {
             // BreakStmt does not have any associated condition, so we dont need anything
             (void)BRK; // Unused
