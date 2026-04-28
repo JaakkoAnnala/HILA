@@ -20,6 +20,8 @@ using namespace clang::ast_matchers;
 // Setup stuff for tests
 
 bool g_print_results = false;
+bool g_make_dot_graph = false;
+bool g_print_all_possible_vals = false;
 
 class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
   public:
@@ -33,7 +35,7 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
     void run(const MatchFinder::MatchResult &Result) override {
         diags.enable_colors(true);
         diag_msg.clear();
-        ASTContext *ASTctx = Result.Context;
+        ASTContext &ASTctx = *Result.Context;
 
         // the function we analyse for testing:
         const FunctionDecl *func = Result.Nodes.getNodeAs<FunctionDecl>("func");
@@ -42,13 +44,29 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
         auto *FB = func->getBody();
 
         evaluator = {};
-        evaluator.init(func, FB, ASTctx);
+        evaluator.init(func, FB, &ASTctx);
+
+        if (g_make_dot_graph)
+            evaluator.cfg->viewCFG(LangOptions());
+
         exec_ret = evaluator.exec();
 
         // After ToolInvocation the Compiler context may get freed so store the names now
         // Use the pointers as keys
         for (auto &all_vals : evaluator.main_state.all_possible_vals) {
             names[(uintptr_t)all_vals.first] = all_vals.first->getNameAsString();
+        }
+
+        if (g_print_all_possible_vals) {
+            llvm::outs() << "------- state.all_possible_vals -------\n";
+            for (auto var_vals : evaluator.main_state.all_possible_vals) {
+                llvm::outs() << loc_str(var_vals.first) << " `" << var_vals.first->getNameAsString()
+                             << "` = [ ";
+                for (auto val : var_vals.second) {
+                    llvm::outs() << val << ", ";
+                }
+                llvm::outs() << " ]\n";
+            }
         }
 
         if (!exec_ret) {
@@ -800,6 +818,34 @@ bool test_basic_LAnd_LOr() {
     TEST_CASE_END;
 }
 
+
+bool test_basic_ternary() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Our ast_eval it
+    TEST_EVAL_STRING_CSTMT(R"(
+    int x = 0;
+    int y = 0;
+    int a = x ? y++ : y--;
+    a = (x+1) ? ++x + 1 : --x - 1;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it 
+    TrackedVar<int> x = 0;
+    TrackedVar<int> y = 0;
+    TrackedVar<int> a = x ? y++ : y--;
+    a = (x+1) ? ++x + 1 : --x - 1;
+    // clang-format on
+    /////////////////////////////////////////////
+    // Compare results
+    COMPARE_AND_SET_TEST_PASS(x);
+    COMPARE_AND_SET_TEST_PASS(y);
+    COMPARE_AND_SET_TEST_PASS(a);
+
+    TEST_CASE_END;
+}
+
 bool test_lots_of_control_flow_things_1() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -1014,6 +1060,9 @@ static std::vector<test_func> test_cases = {
     test_basic_LAnd,
     test_basic_LAnd_LOr,
 
+    // ternary
+    test_basic_ternary,
+
     //
     test_lots_of_control_flow_things_1,
     test_lots_of_control_flow_things_2,
@@ -1030,6 +1079,8 @@ static std::vector<test_func> test_cases = {
     // clang-format on
 };
 
+#if TEST_IDX_EVAL
+// Run all the test cases above
 int main(int argc, char **argv) {
     (void)argv; // Unused
     if (argc > 1)
@@ -1052,3 +1103,38 @@ int main(int argc, char **argv) {
 
     return n_failed;
 }
+
+#elif IDX_EVAL_FILE
+// For manual testing.
+// Runs the idx_expr_evaluator on an input file and analyse a function with name `test`.
+
+#include "clang/Tooling/CommonOptionsParser.h"
+static cl::OptionCategory LoopVarTrackerOpts("LoopVarTrackerOpts options");
+
+static cl::opt<bool> make_dot_graph(
+    "dot",                                  // The flag name
+    cl::desc("Make .dot graph from CFG."),  // Description for --help
+    cl::init(false),                        // Default value
+    cl::cat(LoopVarTrackerOpts)             // Associate with your category
+);
+
+int main(int argc, const char **argv) {
+    auto OptionsParser = CommonOptionsParser::create(argc, argv, LoopVarTrackerOpts);
+    if (!OptionsParser) {
+        exit(1);
+    }
+    auto &optParser = OptionsParser.get();
+    ClangTool Tool(optParser.getCompilations(), optParser.getSourcePathList());
+
+    TestFunctionAnalyzer Analyzer;
+    MatchFinder Finder;
+
+    Finder.addMatcher(functionDecl(hasName("test")).bind("func"), &Analyzer);
+
+    g_print_results = false;
+    g_print_all_possible_vals = true;
+    if(make_dot_graph) g_make_dot_graph = true;
+
+    return Tool.run(newFrontendActionFactory(&Finder).get());
+}
+#endif
