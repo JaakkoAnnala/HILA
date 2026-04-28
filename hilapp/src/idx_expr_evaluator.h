@@ -114,7 +114,7 @@ struct Idx_expr_evaluator {
 
     Eval_state main_state{};
 
-  private:
+//  private:
     std::unique_ptr<CFG> cfg;
     ASTContext *ASTctx;
     CFGBlock *main_entry_block = nullptr;

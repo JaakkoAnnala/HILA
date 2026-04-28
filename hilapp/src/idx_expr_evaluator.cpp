@@ -376,6 +376,12 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
                 return false;
             }
         }
+    } else if (dyn_cast<ConditionalOperator>(E)) {
+        // this is the ternary op (x?a:b)
+        // Similarly as the short circuiting for LAnd/LOr, the result is the last evaluated expression.
+        result.val = state.last_res.val.value();
+        goto successful_return;
+
     } else if (const auto *SCE = dyn_cast<CXXStaticCastExpr>(E)) {
         // TODO: Interpret static_cast as a nop.. This might not be correct..
         const auto *e = SCE->getSubExpr()->IgnoreImpCasts();
@@ -642,6 +648,7 @@ bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx
                || dyn_cast<WhileStmt>(trm_stmt)      //
                || dyn_cast<DoStmt>(trm_stmt)         //
                || dyn_cast<BinaryOperator>(trm_stmt) //
+               || dyn_cast<ConditionalOperator>(trm_stmt) //
     ) {
         if (block.succ_size() != 2) {
             INTERNAL_ERROR << "ERROR: Expected block[" << block.getBlockID()
