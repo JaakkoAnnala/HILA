@@ -8,7 +8,7 @@
  * expressions obtain during evaluation.
  * @details
  * @note Should be tested if there are major changes to llvm. Unit tests for Idx_expr_evaluator
- * are in ../unit_tests/test_idx_expr_evaluator. Tested with llvm 20.1.8.
+ * are in ../unit_tests/test_idx_expr_evaluator. Tested with llvm 18, 20.1.8, 22.1.3
  *
  */
 
@@ -17,8 +17,6 @@
 // ###### Things to NOTE / TODO ######
 
 // TODO: check llvm version requirement...
-
-// TODO: ternary statement x ? y : z NOT IMPLEMENTED YET.
 
 // TODO: At the moment we give up every time that we encounter a control flow that we cannot
 // determine which branch to take. However, if we only care about for example ´x´ in:
