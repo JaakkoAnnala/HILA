@@ -102,8 +102,8 @@ atype measure_dE_wplaq_dt(const GaugeField<group> &U) {
     VectorField<Algebra<group>> K, Kc;
     get_gf_force(U, K);
     get_force_wplaq(U, Kc, -2.0);
-    foralldir(d) {
-        onsites(ALL) {
+    foralldir (d) {
+        onsites (ALL) {
             de += Kc[d][X].dot(K[d][X]);
         }
     }
@@ -117,8 +117,8 @@ atype measure_dE_clov_dt(const GaugeField<group> &U) {
     VectorField<Algebra<group>> K, Kc;
     get_gf_force(U, K);
     get_force_clover(U, Kc, -2.0);
-    foralldir(d) {
-        onsites(ALL) {
+    foralldir (d) {
+        onsites (ALL) {
             de += Kc[d][X].dot(K[d][X]);
         }
     }
@@ -132,8 +132,8 @@ atype measure_dE_log_dt(const GaugeField<group> &U) {
     VectorField<Algebra<group>> K, Kc;
     get_gf_force(U, K);
     get_force_log(U, Kc, -2.0);
-    foralldir(d) {
-        onsites(ALL) {
+    foralldir (d) {
+        onsites (ALL) {
             de += Kc[d][X].dot(K[d][X]);
         }
     }
@@ -214,13 +214,13 @@ atype do_gradient_flow_adapt(GaugeField<group> &V, atype l_start, atype l_end, a
     // arXiv:2101.05320 for derivation of this Runge-Kutta method)
     // and embedded RK2 for adaptive step size
 
-    atype esp = 3.0; // expected single step error scaling power: err ~ step^(esp)
-                     //   - for RK3 with embedded RK2: esp \approx 3.0
+    atype esp = 3.0;        // expected single step error scaling power: err ~ step^(esp)
+                            //   - for RK3 with embedded RK2: esp \approx 3.0
     atype iesp = 1.0 / esp; // inverse single step error scaling power
 
     atype stepmf = 1.0;
-    atype maxstepmf = 10.0;  // max. growth factor of adaptive step size
-    atype minstepmf = 0.1; // min. growth factor of adaptive step size
+    atype maxstepmf = 10.0; // max. growth factor of adaptive step size
+    atype minstepmf = 0.1;  // min. growth factor of adaptive step size
 
     // translate flow scale interval [l_start,l_end] to corresponding
     // flow time interval [t,tmax] :
@@ -275,12 +275,12 @@ atype do_gradient_flow_adapt(GaugeField<group> &V, atype l_start, atype l_end, a
         // get max. local gauge force:
         get_gf_force(V, tk);
         atype maxtk = 0.0;
-        foralldir(d) {
-            onsites(ALL) {
+        foralldir (d) {
+            onsites (ALL) {
                 reldiff[X] = (tk[d][X].squarenorm());
             }
             atype tmaxtk = reldiff.max();
-            if(tmaxtk>maxtk) {
+            if (tmaxtk > maxtk) {
                 maxtk = tmaxtk;
             }
         }
@@ -314,42 +314,45 @@ atype do_gradient_flow_adapt(GaugeField<group> &V, atype l_start, atype l_end, a
         }
 
         get_gf_force(V, k1);
-        foralldir(d) onsites(ALL) {
-            // first steps of RK3 and RK2 are the same :
-            V[d][X] = chexp(k1[d][X] * (step * a11)) * V[d][X];
-        }
+        foralldir (d)
+            onsites (ALL) {
+                // first steps of RK3 and RK2 are the same :
+                V[d][X] = chexp(k1[d][X] * (step * a11)) * V[d][X];
+            }
 
         get_gf_force(V, k2);
-        foralldir(d) onsites(ALL) {
-            // second step of RK2 :
-            // (tk[d][X] will be used for rel. error computation)
-            tk[d][X] = k2[d][X];
-            tk[d][X] *= (step * b22);
-            tk[d][X] += k1[d][X] * (step * b21);
-            V2[d][X] = chexp(tk[d][X]) * V[d][X];
+        foralldir (d)
+            onsites (ALL) {
+                // second step of RK2 :
+                // (tk[d][X] will be used for rel. error computation)
+                tk[d][X] = k2[d][X];
+                tk[d][X] *= (step * b22);
+                tk[d][X] += k1[d][X] * (step * b21);
+                V2[d][X] = chexp(tk[d][X]) * V[d][X];
 
-            // second step of RK3 :
-            k2[d][X] *= (step * a22);
-            k2[d][X] += k1[d][X] * (step * a21);
-            V[d][X] = chexp(k2[d][X]) * V[d][X];
-        }
+                // second step of RK3 :
+                k2[d][X] *= (step * a22);
+                k2[d][X] += k1[d][X] * (step * a21);
+                V[d][X] = chexp(k2[d][X]) * V[d][X];
+            }
 
         get_gf_force(V, k1);
-        foralldir(d) onsites(ALL) {
-            // third step of RK3 :
-            k1[d][X] *= (step * a33);
-            k1[d][X] -= k2[d][X];
-            V[d][X] = chexp(k1[d][X]) * V[d][X];
-        }
+        foralldir (d)
+            onsites (ALL) {
+                // third step of RK3 :
+                k1[d][X] *= (step * a33);
+                k1[d][X] -= k2[d][X];
+                V[d][X] = chexp(k1[d][X]) * V[d][X];
+            }
 
         // determine maximum difference between RK3 and RK2,
         // relative to desired accuracy :
         atype relerr = 0.0;
-        foralldir(d) {
-            onsites(ALL) {
+        foralldir (d) {
+            onsites (ALL) {
                 reldiff[X] = (V2[d][X] * V[d][X].dagger()).project_to_algebra().norm() /
                              (tatol + rtol * tk[d][X].norm() / step);
-                // note: we divide tk.norm() by step to have consistent leading stepsize dependency  
+                // note: we divide tk.norm() by step to have consistent leading stepsize dependency
                 // no mather whether relative or absolute error tollerance dominates
             }
             atype trelerr = reldiff.max();
@@ -375,7 +378,7 @@ atype do_gradient_flow_adapt(GaugeField<group> &V, atype l_start, atype l_end, a
             stepmf = minstepmf;
         } else if (stepmf >= maxstepmf) {
             stepmf = maxstepmf;
-        } 
+        }
 
         // adjust step size :
         step = min((atype)0.9 * stepmf * step, ubstep);
