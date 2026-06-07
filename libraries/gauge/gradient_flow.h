@@ -10,37 +10,64 @@
 #include "gauge/clover_action.h"
 #include "gauge/log_clover_action.h"
 
-#ifdef GFLOWACTION
-#define GFLOWS GFLOWACTION
-#else
-#define GFLOWS 3
-#endif
-
 #include "gauge/bulk_prevention_action.h"
 #include "gauge/improved_action.h"
 #include "gauge/log_plaquette_action.h"
 
-
 #include "tools/string_format.h"
 
+enum GradientFlowAction {
+    Wilson = 0,
+    Bulk_Prevention = 1,
+    Luscher_Weisz = 2,
+    Iwasaki = 3,
+    DBW2 = 4,
+    Log_Plaq = 5,
+    Zeuthen = 6,
+    N_GradientFlowAction,
+};
+
+// Make it possible to select the gradient flow action either at compile time or at run time.
+//
+// if GFLOWACTION is defined action is selected at compile time.
+//
+// Otherwise the user code must declare and set the global variable `g_GF_action` somewhere at run
+// time to select the used action.
+#ifdef GFLOWACTION
+constexpr GradientFlowAction g_GF_action = static_cast<GradientFlowAction>(GFLOWACTION);
+static_assert((0 < GFLOWACTION) && (GFLOWACTION < N_GradientFlowAction),
+              "Unknown GradientFlowAction");
+#else
+extern GradientFlowAction g_GF_action;
+#endif
 
 /// print info about used flow action to stdout from rank 0.
 static inline void print0_gf_info() {
-#if GFLOWS == 1 // BP
-    hila::out0 << "GFINFO using bulk-prevention action\n";
-#elif GFLOWS == 2 // LW
-    hila::out0 << "GFINFO using Luscher-Weisz action\n";
-#elif GFLOWS == 3 // IWASAKI
-    hila::out0 << "GFINFO using Iwasaki action\n";
-#elif GFLOWS == 4 // DBW2
-    hila::out0 << "GFINFO using DBW2 action\n";
-#elif GFLOWS == 5 // LOG-PLAQUETTE
-    hila::out0 << "GFINFO using log-plaquette action\n";
-#elif GFLOWS == 6 // 'Zeuthen' flow, improved gradient term
-    hila::out0 << "GFINFO using Zeuthen flow\n";
-#else             // WILSON
-    hila::out0 << "GFINFO using Wilson's plaquette action\n";
-#endif
+    switch (g_GF_action) {
+    case GradientFlowAction::Wilson: // = 0
+        hila::out0 << "GFINFO using Wilson's plaquette action\n";
+        break;
+    case GradientFlowAction::Bulk_Prevention: // = 1
+        hila::out0 << "GFINFO using bulk-prevention action\n";
+        break;
+    case GradientFlowAction::Luscher_Weisz: // = 2
+        hila::out0 << "GFINFO using Luscher-Weisz action\n";
+        break;
+    case GradientFlowAction::Iwasaki: // = 3
+        hila::out0 << "GFINFO using Iwasaki action\n";
+        break;
+    case GradientFlowAction::DBW2: // = 4
+        hila::out0 << "GFINFO using DBW2 action\n";
+        break;
+    case GradientFlowAction::Log_Plaq: // = 5
+        hila::out0 << "GFINFO using log-plaquette action\n";
+        break;
+    case GradientFlowAction::Zeuthen: // = 6
+        hila::out0 << "GFINFO using Zeuthen flow\n";
+        break;
+    default:
+        assert(false && "Unknown GradientFlowAction");
+    }
 }
 
 template <typename group, typename atype = hila::arithmetic_type<group>>
@@ -80,28 +107,37 @@ void get_gf_force(const GaugeField<group> &U, VectorField<Algebra<group>> &E) {
                      // note: when switching to factor 2.0, remember to change also the stability
                      // limit in the do_gradient_flow_adapt() below
 
-#if GFLOWS == 1 // Bulk-Prevention (BP)
-    get_force_bp(U, E, eps);
-#elif GFLOWS == 2 // Luscher-Weisz (LW)
-    atype c12 = -1.0 / 12.0;     // rectangle weight
-    atype c11 = 1.0 - 8.0 * c12; // plaquette weight
-    get_force_impr(U, E, eps * c11, eps * c12);
-#elif GFLOWS == 3 // IWASAKI
-    atype c12 = -0.331;          // rectangle weight
-    atype c11 = 1.0 - 8.0 * c12; // plaquette weight
-    get_force_impr(U, E, eps * c11, eps * c12);
-#elif GFLOWS == 4 // DBW2
-    atype c12 = -1.4088;         // rectangle weight
-    atype c11 = 1.0 - 8.0 * c12; // plaquette weight
-    get_force_impr(U, E, eps * c11, eps * c12);
-#elif GFLOWS == 5 // LOG-PLAQUETTE
-    get_force_log_plaq(U, E, eps);
-#elif GFLOWS == 6 // 'Zeuthen' flow, improved gradient term
-    get_zeuthen_flow_force(U, E, eps);
-#else             // WILSON
-    get_force_wplaq(U, E, eps);
-#endif
-
+    switch (g_GF_action) {
+    case GradientFlowAction::Wilson: { // = 0
+        get_force_wplaq(U, E, eps);
+    } break;
+    case GradientFlowAction::Bulk_Prevention: { // = 1
+        get_force_bp(U, E, eps);
+    } break;
+    case GradientFlowAction::Luscher_Weisz: { // = 2
+        atype c12 = -1.0 / 12.0;              // rectangle weight
+        atype c11 = 1.0 - 8.0 * c12;          // plaquette weight
+        get_force_impr(U, E, eps * c11, eps * c12);
+    } break;
+    case GradientFlowAction::Iwasaki: { // = 3
+        atype c12 = -0.331;             // rectangle weight
+        atype c11 = 1.0 - 8.0 * c12;    // plaquette weight
+        get_force_impr(U, E, eps * c11, eps * c12);
+    } break;
+    case GradientFlowAction::DBW2: { // = 4
+        atype c12 = -1.4088;         // rectangle weight
+        atype c11 = 1.0 - 8.0 * c12; // plaquette weight
+        get_force_impr(U, E, eps * c11, eps * c12);
+    } break;
+    case GradientFlowAction::Log_Plaq: { // = 5
+        get_force_log_plaq(U, E, eps);
+    } break;
+    case GradientFlowAction::Zeuthen: { // = 6
+        get_zeuthen_flow_force(U, E, eps);
+    } break;
+    default:
+        assert(false && "Unknown GradientFlowAction");
+    }
     // 2/9*BP+7/9*Wilson
     // get_force_bp(U,E,eps*2.0/9.0);
     // get_force_wplaq_add(U,E,eps*7.0/9.0);
@@ -111,26 +147,36 @@ template <typename group, typename atype = hila::arithmetic_type<group>>
 atype measure_gf_s(const GaugeField<group> &U) {
     // wrapper for gauge action computation routine
     // (for gauge action that is used to evolve the flow)
-#if GFLOWS == 1 // BP
-    atype res = measure_s_bp(U);
-#elif GFLOWS == 2 // LW
-    atype c12 = -1.0 / 12.0;     // rectangle weight
-    atype c11 = 1.0 - 8.0 * c12; // plaquette weight
-    atype res = measure_s_impr(U, c11, c12);
-#elif GFLOWS == 3 // IWASAKI
-    atype c12 = -0.331;          // rectangle weight
-    atype c11 = 1.0 - 8.0 * c12; // plaquette weight
-    atype res = measure_s_impr(U, c11, c12);
-#elif GFLOWS == 4 // DBW2
-    atype c12 = -1.4088;         // rectangle weight
-    atype c11 = 1.0 - 8.0 * c12; // plaquette weight
-    atype res = measure_s_impr(U, c11, c12);
-#elif GFLOWS == 5 // LOG-PLAQUETTE
-    atype res = measure_s_log_plaq(U);
-#else             // WILSON
-    atype res = measure_s_wplaq(U);
-#endif
-
+    atype res;
+    switch (g_GF_action) {
+    case GradientFlowAction::Wilson: { // = 0
+        res = measure_s_wplaq(U);
+    } break;
+    case GradientFlowAction::Bulk_Prevention: { // = 1
+        res = measure_s_bp(U);
+    } break;
+    case GradientFlowAction::Zeuthen:         // = 6
+    case GradientFlowAction::Luscher_Weisz: { // = 2
+        atype c12 = -1.0 / 12.0;              // rectangle weight
+        atype c11 = 1.0 - 8.0 * c12;          // plaquette weight
+        res = measure_s_impr(U, c11, c12);
+    } break;
+    case GradientFlowAction::Iwasaki: { // = 3
+        atype c12 = -0.331;             // rectangle weight
+        atype c11 = 1.0 - 8.0 * c12;    // plaquette weight
+        res = measure_s_impr(U, c11, c12);
+    } break;
+    case GradientFlowAction::DBW2: { // = 4
+        atype c12 = -1.4088;         // rectangle weight
+        atype c11 = 1.0 - 8.0 * c12; // plaquette weight
+        res = measure_s_impr(U, c11, c12);
+    } break;
+    case GradientFlowAction::Log_Plaq: { // = 5
+        res = measure_s_log_plaq(U);
+    } break;
+    default:
+        assert(false && "Unknown GradientFlowAction");
+    }
     // 2/9*BP+7/9*Wilson
     // atype res=measure_s_bp(U,E,eps*2.0/9.0)+measure_s_wplaq(U,E,eps*7.0/9.0);
 
