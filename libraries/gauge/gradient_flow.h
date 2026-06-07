@@ -16,18 +16,58 @@
 #define GFLOWS 3
 #endif
 
-#if GFLOWS == 1
 #include "gauge/bulk_prevention_action.h"
-#elif GFLOWS > 1
-#if GFLOWS < 5
 #include "gauge/improved_action.h"
-#else
 #include "gauge/log_plaquette_action.h"
-#endif
-#endif
+
 
 #include "tools/string_format.h"
 
+
+/// print info about used flow action to stdout from rank 0.
+static inline void print0_gf_info() {
+#if GFLOWS == 1 // BP
+    hila::out0 << "GFINFO using bulk-prevention action\n";
+#elif GFLOWS == 2 // LW
+    hila::out0 << "GFINFO using Luscher-Weisz action\n";
+#elif GFLOWS == 3 // IWASAKI
+    hila::out0 << "GFINFO using Iwasaki action\n";
+#elif GFLOWS == 4 // DBW2
+    hila::out0 << "GFINFO using DBW2 action\n";
+#elif GFLOWS == 5 // LOG-PLAQUETTE
+    hila::out0 << "GFINFO using log-plaquette action\n";
+#elif GFLOWS == 6 // 'Zeuthen' flow, improved gradient term
+    hila::out0 << "GFINFO using Zeuthen flow\n";
+#else             // WILSON
+    hila::out0 << "GFINFO using Wilson's plaquette action\n";
+#endif
+}
+
+template <typename group, typename atype = hila::arithmetic_type<group>>
+void get_zeuthen_flow_force(const GaugeField<group> &U, VectorField<Algebra<group>> &E,
+                            atype eps = 1.0) {
+
+    // first get the Luscher-Weisz improved force
+    VectorField<Algebra<group>> F_LW;
+    atype c12 = -1.0 / 12.0; // rectangle weight
+    atype c11 = 5.0 / 3.0;   // plaquette weight
+    get_force_impr(U, F_LW, eps * c11, eps * c12);
+
+    // Zeuthen flow force = (1 + 1/12 D_\mu D_\mu^* ) F_LW
+
+    foralldir (d) {
+        onsites (ALL) {
+            E[d][X] =
+                F_LW[d][X] +
+                (1.0 / 12.0) * ( // calculate gradient term improvement
+                                 // (\mu=d, no sum) D_\mu D_\mu^* F_LW(X)
+                                   left_conjugation(U[d][X], F_LW[d][X])            // U F U^\dagger
+                                   - 2.0 * F_LW[d][X]                               //
+                                   + right_conjugation(U[d][X - d], F_LW[d][X - d]) // U^dagger F U
+                               );
+        }
+    }
+}
 
 template <typename group, typename atype = hila::arithmetic_type<group>>
 void get_gf_force(const GaugeField<group> &U, VectorField<Algebra<group>> &E) {
@@ -56,6 +96,8 @@ void get_gf_force(const GaugeField<group> &U, VectorField<Algebra<group>> &E) {
     get_force_impr(U, E, eps * c11, eps * c12);
 #elif GFLOWS == 5 // LOG-PLAQUETTE
     get_force_log_plaq(U, E, eps);
+#elif GFLOWS == 6 // 'Zeuthen' flow, improved gradient term
+    get_zeuthen_flow_force(U, E, eps);
 #else             // WILSON
     get_force_wplaq(U, E, eps);
 #endif
@@ -147,20 +189,7 @@ void measure_gradient_flow_stuff(const GaugeField<group> &V, atype flow_l, atype
     // and print results in formatted form to standard output
     static bool first = true;
     if (first) {
-        // print info about used flow action
-#if GFLOWS == 1 // BP
-        hila::out0 << "GFINFO using bulk-prevention action\n";
-#elif GFLOWS == 2 // LW
-        hila::out0 << "GFINFO using Luscher-Weisz action\n";
-#elif GFLOWS == 3 // IWASAKI
-        hila::out0 << "GFINFO using Iwasaki action\n";
-#elif GFLOWS == 4 // DBW2
-        hila::out0 << "GFINFO using DBW2 action\n";
-#elif GFLOWS == 5 // LOG-PLAQUETTE
-        hila::out0 << "GFINFO using log-plaquette action\n";
-#else             // WILSON
-        hila::out0 << "GFINFO using Wilson's plaquette action\n";
-#endif
+        print0_gf_info();
         // print legend for flow measurement output
         hila::out0 << "LGFLMEAS  l(ambda)        S-flow        S-plaq        E_plaq    dE_plaq/dl  "
                       "       E_clv     dE_clv/dl     Qtopo_clv         E_log     dE_log/dl     "
