@@ -11,8 +11,12 @@
 CC := mpic++
 LD := mpic++
 
+# The c++ standard - c++17, c++20, c++23 (c++26 in the future)
+# can be overridden on make command
+CPPSTD := c++17
+
 # Define compilation flags
-CXXFLAGS_NOOPT := -x c++ --std=c++17 -fno-rtti
+CXXFLAGS_NOOPT := -x c++ --std=$(CPPSTD) -fno-rtti
 ifndef DEBUG
 	CXXFLAGS := $(CXXFLAGS_NOOPT) -O3 -mavx2 -mfma -march=native
 else

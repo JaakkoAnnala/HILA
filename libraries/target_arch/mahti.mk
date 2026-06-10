@@ -13,13 +13,16 @@ $(info ########################################################################)
 
 ### Define compiler and options
 
+# c++ standard level, can be set in makefile or command line
+CPPSTD := c++17
+
 # Define compiler
 CC := mpic++
 LD := mpic++
 
 # Define compilation flags
-CXXFLAGS  := -O3 -x c++ --std=c++17 -fno-rtti -mavx2 -mfma -march=native
-CXXFLAGS_NOOPT := -x c++ --std=c++17 -fno-rtti
+CXXFLAGS  := -O3 -x c++ --std=$(CPPSTD) -fno-rtti -mavx2 -mfma -march=native
+CXXFLAGS_NOOPT := -x c++ --std=$(CPPSTD) -fno-rtti
 #CXXFLAGS := -g -x c++ --std=c++17
 
 # hilapp needs to know where c++ system include files are located.  This is not a problem if
