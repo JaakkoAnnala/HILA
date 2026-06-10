@@ -153,6 +153,9 @@ llvm::cl::opt<bool>
                              llvm::cl::desc("Comment out '#pragma hila' -pragmas in output"),
                              llvm::cl::cat(HilappCategory));
 
+llvm::cl::opt<std::string> cmdline::cppstd("std", llvm::cl::desc("c++ standard, e.g. -std=c++17"),
+                                   llvm::cl::cat(HilappCategory));
+
 
 llvm::cl::opt<bool> cmdline::no_include(
     "no-include",
@@ -1259,7 +1262,7 @@ int main(int argc, const char **argv) {
     std::vector<const char *> av;
     std::string compiler = handle_cmdline_args(argc, argv, av);
 
-    argc = av.size() - 1;  // last is nullptr;
+    argc = av.size() - 1; // last is nullptr;
     OptionsParser op(argc, av.data(), HilappCategory);
     ClangTool Tool(op.getCompilations(), op.getSourcePathList());
 
@@ -1271,11 +1274,11 @@ int main(int argc, const char **argv) {
 
     if (cmdline::show_includes) {
         llvm::errs() << "----- hilapp include file paths ";
-        if (compiler.size() > 0) 
+        if (compiler.size() > 0)
             llvm::errs() << "(with compiler " << compiler << ")";
         llvm::errs() << '\n';
-        for (const char * p : av) {
-            if (p && p[0] == '-' && p[1] == 'I') 
+        for (const char *p : av) {
+            if (p && p[0] == '-' && p[1] == 'I')
                 llvm::errs() << "    " << p + 2 << '\n';
         }
     }

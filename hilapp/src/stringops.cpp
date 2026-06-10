@@ -300,7 +300,7 @@ std::string get_includes_from_gcc(std::vector<const char *> &av) {
         // The following commmand makes the compiler to produce list of include dirs
         // NOTE: this relies on the compiler identifying the path lines starting
         // with " /" at the beginning of each line.
-        // This is the case for g++ or clang 
+        // This is the case for g++ or clang
         std::string pipecmd =
             "echo | " + compiler + " -c -xc++ --std=c++17 -Wp,-v - 2>&1 | grep '^ /'";
 
@@ -330,7 +330,6 @@ std::string get_includes_from_gcc(std::vector<const char *> &av) {
     // }
 
     return compiler;
-
 }
 
 #endif // USE_COMPILER_INCLUDES
@@ -347,6 +346,7 @@ std::string handle_cmdline_args(int argc, const char **argv, std::vector<const c
     // av[argc + 1] = nullptr;  // I read somewhere that in c++ argv[argc] = 0
     static char ddash[3] = "--"; // needs to be static because ptrs
     int ddashloc = 0;
+    const char * cppstd = "-std=c++17";
 
     avvect.clear();
 
@@ -356,6 +356,15 @@ std::string handle_cmdline_args(int argc, const char **argv, std::vector<const c
         if (strcmp(avvect[i], ddash) == 0) {
             found_ddash = true;
             ddashloc = i;
+        } else if (strncmp(avvect[i], "-std", 4) == 0) {
+            if (strcmp(avvect[i], "-std=c++17") == 0 || strcmp(avvect[i], "-std=c++20") == 0 ||
+                strcmp(avvect[i], "-std=c++23") == 0 || strcmp(avvect[i], "std=c++26") == 0) {
+                cppstd = avvect[i];
+            } else {
+                std::cerr << "ERROR: unknown c++ standard \'" << avvect[i] << "\'\n";
+                std::cerr << "allowed values c++17, c++20, c++23, c++26\n";
+                exit(1);
+            }
         }
     }
     if (!found_ddash) {
@@ -393,9 +402,9 @@ std::string handle_cmdline_args(int argc, const char **argv, std::vector<const c
     compiler = get_includes_from_gcc(avvect);
 #endif
 
-    avvect.push_back("-std=c++17");
+    avvect.push_back(cppstd);
     avvect.push_back("-DHILAPP");
-    avvect.push_back(nullptr);   // last element (avvect[argc]) nullptr
+    avvect.push_back(nullptr); // last element (avvect[argc]) nullptr
 
     return compiler;
 }

@@ -87,6 +87,7 @@ extern llvm::cl::opt<bool> no_interleaved_comm;
 extern llvm::cl::opt<int> verbosity;
 extern llvm::cl::opt<int> avx_info;
 extern llvm::cl::opt<bool> comment_pragmas;
+extern llvm::cl::opt<std::string> cppstd;
 
 extern llvm::cl::opt<bool> allow_func_globals;
 
