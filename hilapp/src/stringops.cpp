@@ -318,7 +318,7 @@ std::string get_includes_from_gcc(std::vector<const char *> &av) {
 
                 includedirs.push_back("-I");
                 includedirs.back() += pipebuf + 1;
-                includedirs.back().back() = 0;
+                includedirs.back().back() = 0; // remove \n
             }
             for (auto &r : includedirs) {
                 av.push_back(r.c_str());
@@ -326,6 +326,10 @@ std::string get_includes_from_gcc(std::vector<const char *> &av) {
             }
         }
         pclose(pipe);
+
+        if (includedirs.size() == 0)
+            std::cerr << "hilapp WARNING: could not find include paths with compiler \"" << compiler
+                      << "\"\n";
     }
 
     // for (auto &r : av) {
