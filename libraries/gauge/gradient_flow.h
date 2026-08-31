@@ -35,7 +35,7 @@ enum GradientFlowAction {
 // time to select the used action.
 #ifdef GFLOWACTION
 constexpr GradientFlowAction g_GF_action = static_cast<GradientFlowAction>(GFLOWACTION);
-static_assert((0 < GFLOWACTION) && (GFLOWACTION < N_GradientFlowAction),
+static_assert((GFLOWACTION >= 0) && (GFLOWACTION < N_GradientFlowAction),
               "Unknown GradientFlowAction");
 #else
 extern GradientFlowAction g_GF_action;
