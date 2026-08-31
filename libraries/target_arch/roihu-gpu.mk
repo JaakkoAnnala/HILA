@@ -7,7 +7,12 @@ $(info ########################################################################)
 $(info Target roihu-gpu: Remember to load modules:)
 $(info module load gcc/15.2.0 openmpi/5.0.8 cuda/13.1.1        # vanilla / overlap)
 $(info module load gcc/15.2.0 openmpi/5.0.8 cuda/13.1.1 nccl   # + GPU_CCL)
-$(info GPU_SHMEM uses nvhpc's bundled nvcc/HPCX/NVSHMEM via the paths below -- no extra module)
+$(info GPU_SHMEM uses nvhpc\'s bundled nvcc/HPCX/NVSHMEM via the paths below -- no extra module)
+$(info )
+$(info Building hilapp on roihu-gpu:)
+$(info     > cd HILA_DIR/singularity )
+$(info     > singularity build hilapp.sif hilapp_local.def )
+$(info     > mv hilapp.sif HILA/hilapp/bin/hilapp )
 $(info ########################################################################)
 
 # ---------------------------------------------------------------------------
