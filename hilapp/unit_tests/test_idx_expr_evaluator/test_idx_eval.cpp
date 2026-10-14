@@ -12,6 +12,8 @@ using namespace clang::ast_matchers;
 
 #include "tracked_var.h"
 
+#include <cstdlib>
+
 #include "../../src/idx_expr_evaluator.h"
 #define DIAGS_TO_STR
 #include "../../src/idx_expr_evaluator.cpp" // yes this is intentional, diag_msg
@@ -19,13 +21,68 @@ using namespace clang::ast_matchers;
 /////////////////////////////////////////////////////////////////
 // Setup stuff for tests
 
-bool g_print_results = false;
+int g_verbosity = 0;
 bool g_make_dot_graph = false;
 bool g_print_all_possible_vals = false;
 // Evaluate the test cases with exec_WLF() instead of exec()
 bool g_use_wlf_evaluator = false;
 // If non zero, overrides Eval_state::max_block_states
 uint64_t g_max_block_states = 0;
+
+std::string g_test_output;
+
+inline llvm::raw_ostream &test_out() {
+    static llvm::raw_string_ostream out(g_test_output);
+    // the output ends up in llvm::outs()
+    static const bool colors_set = (out.enable_colors(llvm::outs().has_colors()), true);
+    (void)colors_set;
+    return out;
+}
+
+// Print the output of a test case collected in test_out()
+inline void print_test_output(bool test_pass, unsigned indent = 8) {
+    test_out().flush();
+    if (g_verbosity >= 2 || (g_verbosity == 1 && !test_pass)) {
+        StringRef rest(g_test_output);
+        while (!rest.empty()) {
+            auto [line, tail] = rest.split('\n');
+            llvm::outs().indent(indent) << line << "\n";
+            rest = tail;
+        }
+    }
+    g_test_output.clear();
+}
+
+// Prints the compiler diagnostics for the test input to test_out(), one line each
+class Test_diag_consumer : public DiagnosticConsumer {
+  public:
+    void HandleDiagnostic(DiagnosticsEngine::Level level, const Diagnostic &info) override {
+        DiagnosticConsumer::HandleDiagnostic(level, info);
+        SmallString<128> msg;
+        info.FormatDiagnostic(msg);
+        llvm::raw_ostream &os = test_out();
+        if (info.hasSourceManager() && info.getLocation().isValid())
+            os << info.getLocation().printToString(info.getSourceManager()) << ": ";
+        switch (level) {
+        case DiagnosticsEngine::Note:
+            os << "note: ";
+            break;
+        case DiagnosticsEngine::Remark:
+            os << "remark: ";
+            break;
+        case DiagnosticsEngine::Warning:
+            os << "warning: ";
+            break;
+        case DiagnosticsEngine::Error:
+        case DiagnosticsEngine::Fatal:
+            os << "error: ";
+            break;
+        default:
+            break;
+        }
+        os << msg << "\n";
+    }
+};
 
 class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
   public:
@@ -62,8 +119,7 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
         if (g_max_block_states != 0)
             evaluator.main_state.max_block_states = g_max_block_states;
 
-        exec_ret = g_use_wlf_evaluator ? evaluator.exec_WLF()
-                                                                  : evaluator.exec();
+        exec_ret = g_use_wlf_evaluator ? evaluator.exec_WLF() : evaluator.exec();
 
         // After ToolInvocation the Compiler context may get freed so store the names now
         // Use the pointers as keys
@@ -72,26 +128,27 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
         }
 
         if (g_print_all_possible_vals) {
-            llvm::outs() << "------- state.all_possible_vals -------\n";
+            test_out() << "------- state.all_possible_vals -------\n";
             for (auto var_vals : evaluator.main_state.all_possible_vals) {
-                llvm::outs() << loc_str(var_vals.first) << " `" << var_vals.first->getNameAsString()
-                             << "` = [ ";
+                test_out() << loc_str(var_vals.first) << " `" << var_vals.first->getNameAsString()
+                           << "` = [ ";
                 for (auto val : var_vals.second) {
-                    llvm::outs() << val << ", ";
+                    test_out() << val << ", ";
                 }
-                llvm::outs() << " ]\n";
+                test_out() << " ]\n";
             }
         }
 
         if (!exec_ret) {
-            llvm::errs() << diag_msg;
+            test_out() << diag_msg;
         }
     }
 };
 
 #define TEST_EVAL_COMMON_                                                                          \
     std::string fname = "input.cpp";                                                               \
-    std::vector<std::string> args = {"clang-tool", "-std=c++17", fname};                           \
+    /* -fno-caret-diagnostics: no "N warnings generated." to stderr, Test_diag_consumer prints */  \
+    std::vector<std::string> args = {"clang-tool", "-std=c++17", "-fno-caret-diagnostics", fname}; \
     FixedCompilationDatabase Compilations(".", args);                                              \
     IntrusiveRefCntPtr<llvm::vfs::InMemoryFileSystem> InMemoryFS(                                  \
         new llvm::vfs::InMemoryFileSystem());                                                      \
@@ -106,12 +163,14 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
     ToolInvocation Invocation(args, std::move(action),                                             \
                               Files); /*this seems to free Files, .. eventhoug a comment says it   \
                                          does not take ownership..*/                               \
+    Test_diag_consumer test_diag_consumer;                                                         \
+    Invocation.setDiagnosticConsumer(&test_diag_consumer);                                         \
     const auto &test_state = test_analyzer.evaluator.main_state;                                   \
     const auto &test_names = test_analyzer.names;                                                  \
     Invocation.run();                                                                              \
     if (test_analyzer.input_has_errors) {                                                          \
         test_pass = false;                                                                         \
-        color_msg(llvm::outs(), RED, "Test input does not compile", true, __FILE__, __LINE__)      \
+        color_msg(test_out(), RED, "Test input does not compile", true, __FILE__, __LINE__)        \
             << "\n";                                                                               \
     }
 
@@ -154,15 +213,15 @@ inline bool compare_var_expect(std::string var_name, const std::set<T> &expected
                                const std::unordered_map<uintptr_t, std::string> &names) {
     const auto *var_vals = get_possible_values_for_var(var_name, state, names);
     if (!var_vals) {
-        llvm::outs() << "Did not find var in test_state with name `" << var_name << "`\n";
+        test_out() << "Did not find var in test_state with name `" << var_name << "`\n";
         return false;
     }
     // quick hack, convert std::optionals to int
     std::set<T> vars;
     for (auto v : *var_vals) {
         if (!v.has_value()) {
-            llvm::outs() << "Found a nullopt in possible values for var `" << var_name
-                         << "` in test_state \n";
+            test_out() << "Found a nullopt in possible values for var `" << var_name
+                       << "` in test_state \n";
             return false;
         }
         vars.insert(v.value());
@@ -178,16 +237,16 @@ inline bool compare_var_expect(std::string var_name, const std::set<T> &expected
     do {                                                                                           \
         auto *a_vals = get_possible_values_for_var(VAR, test_state, test_names);                   \
         if (!a_vals) {                                                                             \
-            llvm::outs() << "Var result: Did not find var `" VAR "`\n";                            \
+            test_out() << "Var result: Did not find var `" VAR "`\n";                              \
         } else {                                                                                   \
-            llvm::outs() << "Var result: `" VAR "` = ";                                            \
-            print_set(llvm::outs(), *a_vals);                                                      \
+            test_out() << "Var result: `" VAR "` = ";                                              \
+            print_set(test_out(), *a_vals);                                                        \
         }                                                                                          \
     } while (0)
 #define print_var_expect(VAR, VALUES)                                                              \
     do {                                                                                           \
-        llvm::outs() << "Var expect: `" #VAR "` = ";                                               \
-        print_set(llvm::outs(), VALUES);                                                           \
+        test_out() << "Var expect: `" #VAR "` = ";                                                 \
+        print_set(test_out(), VALUES);                                                             \
     } while (0)
 
 // Compare the possible values of the variable `VAR` in the evaluated code against the set VALUES.
@@ -197,11 +256,11 @@ inline bool compare_var_expect(std::string var_name, const std::set<T> &expected
     do {                                                                                           \
         if (!compare_var_expect(#VAR, VALUES, test_state, test_names)) {                           \
             test_pass = false;                                                                     \
-            color_msg(llvm::outs(), RED, "Results differ for var ", true, __FILE__, __LINE__)      \
+            color_msg(test_out(), RED, "Results differ for var ", true, __FILE__, __LINE__)        \
                 << "`" #VAR "`\n";                                                                 \
             print_var_result(#VAR);                                                                \
             print_var_expect(VAR, VALUES);                                                         \
-        } else if (g_print_results) {                                                              \
+        } else if (g_verbosity >= 2) {                                                             \
             print_var_result(#VAR);                                                                \
             print_var_expect(VAR, VALUES);                                                         \
         }                                                                                          \
@@ -217,18 +276,21 @@ inline bool compare_var_expect(std::string var_name, const std::set<T> &expected
         const auto *u_vals = get_possible_values_for_var(#VAR, test_state, test_names);            \
         if (!u_vals || u_vals->count(std::nullopt) == 0) {                                         \
             test_pass = false;                                                                     \
-            color_msg(llvm::outs(), RED, "Expected an unknown value for var ", true, __FILE__,     \
+            color_msg(test_out(), RED, "Expected an unknown value for var ", true, __FILE__,       \
                       __LINE__)                                                                    \
                 << "`" #VAR "`\n";                                                                 \
             print_var_result(#VAR);                                                                \
-        } else if (g_print_results) {                                                              \
+        } else if (g_verbosity >= 2) {                                                             \
             print_var_result(#VAR);                                                                \
         }                                                                                          \
     } while (0)
 
-#define TEST_CASE_BEGIN bool test_pass = true;
+#define TEST_CASE_BEGIN                                                                            \
+    bool test_pass = true;                                                                         \
+    g_test_output.clear()
 
 #define TEST_CASE_END                                                                              \
+    print_test_output(test_pass);                                                                  \
     if (!test_pass) {                                                                              \
         color_msg(llvm::outs(), RED, " TEST FAILED: ", true, __FILE__, __LINE__)                   \
             << __func__ << "\n";                                                                   \
@@ -1853,17 +1915,28 @@ static std::vector<test_func> wlf_test_cases = {
 #if TEST_IDX_EVAL
 // Run all the test cases above
 int main(int argc, char **argv) {
-    (void)argv; // Unused
-    if (argc > 1)
-        g_print_results = true;
+    for (int i = 1; i < argc; ++i) {
+        char *end = nullptr;
+        if (std::string(argv[i]) == "-v" && i + 1 < argc &&
+            (g_verbosity = std::strtol(argv[i + 1], &end, 10),
+             *end == '\0' && end != argv[i + 1])) {
+            ++i;
+        } else {
+            llvm::errs() << "Usage: " << argv[0] << " [-v <number>]\n"
+                         << "  -v 0   print only the test case results (TEST PASSED / FAILED)\n"
+                         << "  -v 1   also print the output of the failed test cases (default)\n"
+                         << "  -v 2   print the output of all test cases\n";
+            return 1;
+        }
+    }
 
     // Run test_cases with exec(), then test_cases and wlf_test_cases with exec_WLF()
     int n_failed = 0;
     size_t n_runs = 0;
     for (bool use_wlf : {false, true}) {
         g_use_wlf_evaluator = use_wlf;
-        llvm::outs() << "========== Running test cases with "
-                     << (use_wlf ? "exec_WLF()" : "exec()") << " ==========\n";
+        llvm::outs() << "========== Running test cases with " << (use_wlf ? "exec_WLF()" : "exec()")
+                     << " ==========\n";
         std::vector<test_func> cases = test_cases;
         if (use_wlf)
             cases.insert(cases.end(), wlf_test_cases.begin(), wlf_test_cases.end());
@@ -1877,11 +1950,13 @@ int main(int argc, char **argv) {
 
     if (n_failed != 0) {
         llvm::outs() << "Test statistics: " << n_failed << " / " << n_runs;
-        color_msg(llvm::outs(), RED, " test cases failed.\n");
+        llvm::outs().changeColor(RED, true) << " test cases failed.";
+        llvm::outs().resetColor() << "\n";
     } else {
         llvm::outs() << "Test statistics: " << n_failed << " / " << n_runs
                      << " test cases failed.\n";
-        color_msg(llvm::outs(), GREEN, " All test cases passed.\n");
+        llvm::outs().changeColor(GREEN, true) << " All test cases passed.";
+        llvm::outs().resetColor() << "\n";
     }
 
     return n_failed;
@@ -1913,11 +1988,14 @@ int main(int argc, const char **argv) {
 
     Finder.addMatcher(functionDecl(hasName("test")).bind("func"), &Analyzer);
 
-    g_print_results = false;
     g_print_all_possible_vals = true;
     if (make_dot_graph)
         g_make_dot_graph = true;
 
-    return Tool.run(newFrontendActionFactory(&Finder).get());
+    const int ret = Tool.run(newFrontendActionFactory(&Finder).get());
+    // the output of TestFunctionAnalyzer is collected in test_out()
+    test_out().flush();
+    llvm::outs() << g_test_output;
+    return ret;
 }
 #endif
