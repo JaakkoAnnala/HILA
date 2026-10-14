@@ -209,6 +209,23 @@ inline bool compare_var_expect(std::string var_name, const std::set<T> &expected
 
 #define COMPARE_AND_SET_TEST_PASS(VAR) COMPARE_VALUES_AND_SET_TEST_PASS(VAR, (VAR).values)
 
+// For variables that can not be tracked: check that the possible values of `VAR` in the
+// evaluated code contain an unknown value (std::nullopt), so that they are not reported as
+// reliable.
+#define EXPECT_UNKNOWN_AND_SET_TEST_PASS(VAR)                                                      \
+    do {                                                                                           \
+        const auto *u_vals = get_possible_values_for_var(#VAR, test_state, test_names);            \
+        if (!u_vals || u_vals->count(std::nullopt) == 0) {                                         \
+            test_pass = false;                                                                     \
+            color_msg(llvm::outs(), RED, "Expected an unknown value for var ", true, __FILE__,     \
+                      __LINE__)                                                                    \
+                << "`" #VAR "`\n";                                                                 \
+            print_var_result(#VAR);                                                                \
+        } else if (g_print_results) {                                                              \
+            print_var_result(#VAR);                                                                \
+        }                                                                                          \
+    } while (0)
+
 #define TEST_CASE_BEGIN bool test_pass = true;
 
 #define TEST_CASE_END                                                                              \
@@ -971,6 +988,160 @@ bool test_side_effects_with_unknown_operand() {
     TEST_CASE_END;
 }
 
+bool test_side_effects_in_store_to_non_variable() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // The side effects on both sides of an assignment to something that is not a plain
+    // variable (array element, struct member) must happen.
+    TEST_EVAL_STRING_CSTMT(R"(
+    int arr[4];
+    struct S { int m; } s;
+    int i = 0;
+    arr[0] = i++;
+    arr[i++] = 5;
+    arr[1] = 0;
+    arr[1] += i++;
+    s.m = i++;
+    int y = 0;
+    y = i;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+    int arr[4];
+    struct S { int m; } s;
+    TrackedVar<int> i = 0;
+    arr[0] = i++;
+    arr[i++] = 5;
+    arr[1] = 0;
+    arr[1] += i++;
+    s.m = i++;
+    TrackedVar<int> y = 0;
+    y = i;
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(i);
+    COMPARE_AND_SET_TEST_PASS(y);
+
+    TEST_CASE_END;
+}
+
+bool test_ref_arg_unknown_function() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // A function we can not evaluate may change `x` through the reference parameter, so `x`
+    // and everything computed from it after the call is unknown.
+    TEST_EVAL_STRING_TOPLVL(R"(
+void add10(int &a);
+void test(){
+    int x = 0;
+    add10(x);
+    int y = 0;
+    y = x;
+}
+    )")
+    /////////////////////////////////////////////
+    // Can not be evaluated normally, the body of add10() is not known.
+    /////////////////////////////////////////////
+    if (!test_analyzer.exec_ret)
+        test_pass = false;
+    EXPECT_UNKNOWN_AND_SET_TEST_PASS(x);
+    EXPECT_UNKNOWN_AND_SET_TEST_PASS(y);
+
+    TEST_CASE_END;
+}
+
+bool test_ref_arg_constexpr_function() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // A constexpr function changes `x` through the reference parameter
+    TEST_EVAL_STRING_TOPLVL(R"(
+constexpr void add10(int &a){
+    a += 10;
+}
+void test(){
+    int x = 0;
+    add10(x);
+    int y = 0;
+    y = x;
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+// use a lambda so we can keep it contained in the test function, `auto &` so that it also
+// takes a TrackedVar ...
+// constexpr void add10(int &a){
+constexpr auto add10 = [](auto &a){
+    a += 10;
+};
+//void test(){
+    TrackedVar<int> x = 0;
+    add10(x);
+    TrackedVar<int> y = 0;
+    y = x;
+//}
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+    COMPARE_AND_SET_TEST_PASS(y);
+
+    TEST_CASE_END;
+}
+
+bool test_ref_arg_constructor() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // A constructor we do not evaluate may change `x` through the reference parameter
+    TEST_EVAL_STRING_TOPLVL(R"(
+struct Set7 {
+    Set7(int &a) { a = 7; }
+};
+void test(){
+    int x = 0;
+    Set7 s(x);
+    int y = 0;
+    y = x;
+}
+    )")
+    /////////////////////////////////////////////
+    // The evaluator does not evaluate constructors, so the values can not be compared.
+    /////////////////////////////////////////////
+    if (!test_analyzer.exec_ret)
+        test_pass = false;
+    EXPECT_UNKNOWN_AND_SET_TEST_PASS(x);
+    EXPECT_UNKNOWN_AND_SET_TEST_PASS(y);
+
+    TEST_CASE_END;
+}
+
+bool test_reference_variable() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Assigning through a reference variable changes `x`
+    TEST_EVAL_STRING_CSTMT(R"(
+    int x = 0;
+    int &r = x;
+    r = 5;
+    int y = 0;
+    y = x;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+    TrackedVar<int> x = 0;
+    TrackedVar<int> &r = x;
+    r = 5;
+    TrackedVar<int> y = 0;
+    y = x;
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+    COMPARE_AND_SET_TEST_PASS(y);
+
+    TEST_CASE_END;
+}
+
 bool test_lots_of_control_flow_things_1() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -1626,6 +1797,13 @@ static std::vector<test_func> test_cases = {
 
     // side effects
     test_side_effects_with_unknown_operand,
+    test_side_effects_in_store_to_non_variable,
+
+    // changes through references
+    test_ref_arg_unknown_function,
+    test_ref_arg_constexpr_function,
+    test_ref_arg_constructor,
+    test_reference_variable,
 
     // implicit conversions
     test_int_to_bool_conversion,

@@ -165,11 +165,20 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             // TODO: for now LHS has to be a simple VarRefDecl
             const auto *dreLHS = dyn_cast<DeclRefExpr>(LHS->IgnoreParenImpCasts());
             if (!dreLHS) {
+                // The assigned value is not tracked, but both sides have to be evaluated for
+                // their side effects, e.g. `arr[i] = i++`. Since C++17 the RHS is evaluated
+                // before the LHS. (previously undefined behaviour)
+                Eval_result rhs_res{};
+                if (!eval_expr(rhs_res, RHS, state, ASTctx))
+                    return false;
+                Eval_result lhs_res{};
+                if (!eval_expr(lhs_res, LHS, state, ASTctx))
+                    return false;
 
                 INTERNAL_NOTE_IF(E)
-                    << "Only evaluating assignments if LHS is DeclRefExpr: Here it is instead `"
-                    << LHS->IgnoreParenBaseCasts()->getStmtClassName() << "` Not evaluating. "
-                    << loc_str(LHS) << "\n";
+                    << "Only tracking assignments if LHS is DeclRefExpr: Here it is instead `"
+                    << LHS->IgnoreParenBaseCasts()->getStmtClassName()
+                    << "` Not tracking the assigned value. " << loc_str(LHS) << "\n";
                 // TODO: maybe some cases could be evaluated?
                 result.val = std::nullopt;
                 goto successful_return;
@@ -557,8 +566,24 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
 
         // TODO: ... not trying to eval these for now
 
-        INTERNAL_NOTE << " Not trying to eval ArraySubscriptExpr. Ignoring for now "
-                      << loc_str(array_subscript) << "\n";
+        INTERNAL_NOTE_IF(E) << " Not trying to eval ArraySubscriptExpr. Ignoring for now "
+                            << loc_str(array_subscript) << "\n";
+        goto successful_return;
+
+    } else if (const auto *member = dyn_cast<MemberExpr>(E)) {
+        // The base has to be evaluated since it might affect variables we care about, e.g.
+        // `arr[x++].m`. `this` has no side effects.
+        const Expr *base = member->getBase();
+        if (!isa<CXXThisExpr>(base->IgnoreParenImpCasts())) {
+            Eval_result base_res{};
+            if (!eval_expr(base_res, base, state, ASTctx))
+                return false;
+        }
+
+        // TODO: ... not trying to eval these for now
+
+        INTERNAL_NOTE_IF(E) << " Not trying to eval MemberExpr. Ignoring for now "
+                            << loc_str(member) << "\n";
         goto successful_return;
     }
 
