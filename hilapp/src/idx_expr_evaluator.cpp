@@ -112,6 +112,22 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         result = paren_expr_val;
         goto successful_return;
 
+    } else if (const auto *IC = dyn_cast<ImplicitCastExpr>(E)) {
+        // Must come before the DeclRefExpr case below, which looks through implicit casts and
+        // would otherwise skip e.g. the int -> bool conversion in `bool t = x;`.
+        // Evaluate one cast level at a time so nested casts are all applied.
+        if (!eval_expr(result, IC->getSubExpr(), state, ASTctx))
+            return false;
+
+        if (IC->getCastKind() == CK_IntegralToBoolean) {
+            if (result.val.has_value())
+                result.val = (bool)result.val.value();
+        } else if (IC->getCastKind() != CK_LValueToRValue && IC->getCastKind() != CK_NoOp) {
+            // TODO: Interpret Implicit casts as a nop.. This might not be correct..
+            INTERNAL_NOTE_IF(E) << "Ignoring implicit cast " << IC->getCastKindName() << "\n";
+        }
+        goto successful_return;
+
     } else if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts())) {
 
         // check if its an enum constant
