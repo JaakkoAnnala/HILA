@@ -41,16 +41,16 @@ class TrackedVar {
 
 #undef DEF_BOP_THAT_ASSIGNS
 
-    // pre inc/dec
-    T operator++() {
-        T ret = ++val;
+    // pre inc/dec, return a reference like for built-in types: `T &r = ++x;`
+    TrackedVar &operator++() {
+        ++val;
         values.insert(val);
-        return ret;
+        return *this;
     }
-    T operator--() {
-        T ret = --val;
+    TrackedVar &operator--() {
+        --val;
         values.insert(val);
-        return ret;
+        return *this;
     }
     // post inc/dec
     T operator++(int) {
