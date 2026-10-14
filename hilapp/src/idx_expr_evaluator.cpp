@@ -247,7 +247,18 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
 
             if (!eval_expr(rhs_res, RHS, state, ASTctx))
                 return false;
-            if (!rhs_res.val.has_value())
+
+            //// [C99 6.5.17] Comma operator.
+            // BO_Comma // ","
+            if (op == BO_Comma) {
+                // comma operator evals both and returns the rhs, whether the lhs is known or not
+                // This is before the !lhs_res.val.has_value() check below so that exprs like
+                // (unknown, 123) is still evaluated to the known value 123.
+                result = rhs_res;
+                goto successful_return;
+            }
+
+            if (!lhs_res.val.has_value() || !rhs_res.val.has_value())
                 goto successful_return; // We dont know the values just return the nullopt
 
             switch (op) {
@@ -286,13 +297,7 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             case BO_Xor:  BOP_EXPR(^); break;
                 //// [C99 6.5.12] Bitwise OR operator.
             case BO_Or:  BOP_EXPR(|); break;
-            // clang-format on
-            //// [C99 6.5.17] Comma operator.
-            // BO_Comma // ","
-            case BO_Comma: { // comma operator evals both and returns the rhs
-                result.val = (lhs_res.val.value(), rhs_res.val.value());
-                goto successful_return;
-            }
+                // clang-format on
 #undef BOP_EXPR
             default:
                 INTERNAL_ERROR << " TODO: eval_expr BO opcode not implemented `"
