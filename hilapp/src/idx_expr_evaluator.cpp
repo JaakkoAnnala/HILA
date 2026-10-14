@@ -576,13 +576,21 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         // the call needs a separate Eval_state
         Eval_state call_state;
 
-        // TODO: FIXME: Probably needs to be fixed for c++ methods since they have an implicit this
-        // pointer..
-        // NOTE: !!! This assumes CE->arguments() and func->parameters() are in the same
-        // order... They probably are not in the case of class method calls..
-        // Prepare the argument values to the function call
-        int i = 0;
-        for (auto arg_expr : CE->arguments()) {
+        // eval the argument values to the function call 
+        // CE->arguments() map to func->parameters() one to one
+        // NOTE edge cases:
+        //  - call to a member operator, e.g. `obj(a)` or `obj + a` (CXXOperatorCallExpr), has
+        //    the object as its first argument. A member function call `obj.f(a)`
+        //    (CXXMemberCallExpr) does not, and the parameters never include the implicit 'this' pointer.
+        //    TODO: C++23 explicit object parameters `this Self &self` are not handled
+        //  - C-style variadic function has more arguments than parameters.
+        // Arguments without a parameter are only evaluated for their side effects.
+        // TODO: the object is not passed to member functions, so its members are unknown there
+        const auto *method = dyn_cast_or_null<CXXMethodDecl>(func);
+        const unsigned first_param_arg =
+            (isa<CXXOperatorCallExpr>(CE) && method != nullptr && !method->isStatic()) ? 1 : 0;
+        unsigned i = 0;
+        for (const Expr *arg_expr : CE->arguments()) {
             // the ->arguments() contains CXXDefaultArgExpr which are now taken care of the
             // eval_expr. So default arguments are taken care of.
             Eval_result arg_val{};
@@ -590,12 +598,12 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             // which can affect the result..
             if (!eval_expr(arg_val, arg_expr, state, ASTctx))
                 return false;
-            if (do_eval) {
-                auto vd = dyn_cast<VarDecl>(func->parameters()[i]);
+            if (do_eval && i >= first_param_arg && i - first_param_arg < func->getNumParams()) {
+                const ParmVarDecl *param = func->getParamDecl(i - first_param_arg);
                 // A worklist path may reach a constexpr call with an unknown
                 // argument. Preserve that fact in the callee instead of
                 // throwing std::bad_optional_access here.
-                call_state.vars[vd] = arg_val.val;
+                call_state.vars[param] = arg_val.val;
             }
             i++;
         }

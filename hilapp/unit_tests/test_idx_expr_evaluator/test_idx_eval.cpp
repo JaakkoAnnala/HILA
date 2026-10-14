@@ -1785,6 +1785,51 @@ bool test_unknown_loop_converges() {
     TEST_CASE_END;
 }
 
+bool test_constexpr_member_operator_call() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // A member function call `obj.f(a)` does not have the object in its arguments, a member
+    // operator call `obj(a, b)` (CXXOperatorCallExpr) has it as the first argument. The
+    // parameters of both are without the implicit object.
+    TEST_EVAL_STRING_TOPLVL(R"(
+struct Add2 {
+    constexpr int f(int a) const { return a + 2; }
+};
+struct Sub {
+    constexpr int operator()(int a, int b) const { return a - b; }
+};
+void test(){
+    Add2 add2;
+    Sub sub;
+    int x = 0;
+    x = add2.f(5);
+    x = sub(5, 1);
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+// local classes so we can keep them contained in the test function
+struct Add2 {
+    constexpr int f(int a) const { return a + 2; }
+};
+struct Sub {
+    constexpr int operator()(int a, int b) const { return a - b; }
+};
+//void test(){
+    Add2 add2;
+    Sub sub;
+    TrackedVar<int> x = 0;
+    x = add2.f(5);
+    x = sub(5, 1);
+//}
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+
+    TEST_CASE_END;
+}
+
 bool test_constexpr_func_unknown_branch() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -1952,6 +1997,7 @@ static std::vector<test_func> test_cases = {
 
     // calling constexpr functions
     test_constexpr_func,
+    test_constexpr_member_operator_call,
 
     // should fail
     test_should_fail_1,
