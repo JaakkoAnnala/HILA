@@ -846,6 +846,30 @@ bool test_basic_ternary() {
     TEST_CASE_END;
 }
 
+bool test_int_to_bool_conversion() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Our ast_eval it
+    TEST_EVAL_STRING_CSTMT(R"(
+    int x = 5;
+    bool t = x;
+    int z = 0;
+    z = t + 1;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+    int x = 5;
+    bool t = x;
+    TrackedVar<int> z = 0;
+    z = t + 1;
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(z);
+
+    TEST_CASE_END;
+}
+
 bool test_lots_of_control_flow_things_1() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -1062,6 +1086,9 @@ static std::vector<test_func> test_cases = {
 
     // ternary
     test_basic_ternary,
+
+    // implicit conversions
+    test_int_to_bool_conversion,
 
     //
     test_lots_of_control_flow_things_1,
