@@ -85,6 +85,54 @@ inline void track_expr(Eval_result &result, const Expr *E, Eval_state &state) {
     vals->second.insert(result.val);
 }
 
+// Reference variables, e.g. `int &r = x;`: a write through `r` changes `x`, and a write to `x`
+// changes the value of `r`. TODO: track these properly. For now reading such a reference gives an
+// unknown value, and a write through it makes the variable it refers to unknown.
+
+// True for a variable of reference type to an integer type (what we track) that refers to some
+// other variable. Not for function parameters: their argument values are copied in, see the
+// CallExpr case of eval_expr(). Not for references bound to a temporary, e.g.
+// `const int &r = x + 1;`, which just hold a value.
+static bool is_alias_reference(const VarDecl *VD) {
+    if (!VD->getType()->isReferenceType() || isa<ParmVarDecl>(VD) ||
+        !VD->getType().getNonReferenceType()->isIntegralOrEnumerationType())
+        return false;
+    const Expr *init = VD->getInit();
+    if (init == nullptr)
+        return true; // e.g. `extern int &r;`, refers to something we do not know
+    if (const auto *cleanups = dyn_cast<ExprWithCleanups>(init))
+        init = cleanups->getSubExpr();
+    return !isa<MaterializeTemporaryExpr>(init->IgnoreParens());
+}
+
+// variable the alias reference VD refers to, nullptr if it can not be determined from the
+// initializer, e.g. `int &r = c ? x : z;`
+static const VarDecl *alias_reference_target(const VarDecl *VD, ASTContext &ASTctx) {
+    // Follow references to references, `int &r2 = r;`. Limit the depth for `int &r = r;`.
+    for (int depth = 0; depth < 16 && VD != nullptr && is_alias_reference(VD); ++depth) {
+        if (VD->getInit() == nullptr)
+            return nullptr;
+        const auto *DRE = dyn_cast<DeclRefExpr>(VD->getInit()->IgnoreParenNoopCasts(ASTctx));
+        VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+    }
+    return (VD != nullptr && !is_alias_reference(VD)) ? VD : nullptr;
+}
+
+// write through the alias reference `ref`: the variable it refers to becomes unknown, or all
+// variables if we do not know which one it is
+static void write_through_alias_reference(const VarDecl *ref, Eval_state &state,
+                                          ASTContext &ASTctx) {
+    if (const VarDecl *target = alias_reference_target(ref, ASTctx)) {
+        state.vars[target] = std::nullopt;
+        state.all_possible_vals[target].insert(std::nullopt);
+    } else {
+        for (auto &[VD, value] : state.vars) {
+            value = std::nullopt;
+            state.all_possible_vals[VD].insert(std::nullopt);
+        }
+    }
+}
+
 // recursively eval
 bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext &ASTctx) {
     result.val = std::nullopt;
@@ -110,6 +158,16 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         if (!eval_expr(default_val, default_arg->getExpr(), state, ASTctx))
             return false;
         result = default_val;
+        goto successful_return;
+
+    } else if (isa<MaterializeTemporaryExpr, ExprWithCleanups>(E)) {
+        // A temporary, eg bound to a reference `const int &r = x + 1;`, has the value of its
+        // subexpression. ExprWithCleanups marks where temporaries are destroyed
+        const Expr *sub = isa<MaterializeTemporaryExpr>(E)
+                              ? cast<MaterializeTemporaryExpr>(E)->getSubExpr()
+                              : cast<ExprWithCleanups>(E)->getSubExpr();
+        if (!eval_expr(result, sub, state, ASTctx))
+            return false;
         goto successful_return;
 
     } else if (const auto *PE = dyn_cast<ParenExpr>(E)) {
@@ -147,6 +205,13 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         if (!VD) {
             INTERNAL_ERROR << " No VarDecl found for DeclRefExpr " << loc_str(DRE) << "\n";
             return false;
+        }
+
+        if (is_alias_reference(VD)) {
+            // TODO: track references
+            INTERNAL_NOTE_IF(E) << " Not tracking the value of a reference variable "
+                                << loc_str(DRE) << "\n";
+            goto successful_return;
         }
 
         if (state.vars.find(VD) == state.vars.end()) {
@@ -189,6 +254,18 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
                                   "an associated VarDecl."
                                << loc_str(dreLHS) << "\n";
                 return false;
+            }
+
+            if (is_alias_reference(VD)) {
+                // TODO: track references
+                Eval_result rhs_res{};
+                if (!eval_expr(rhs_res, RHS, state, ASTctx))
+                    return false;
+                write_through_alias_reference(VD, state, ASTctx);
+                INTERNAL_NOTE_IF(E) << " Assignment through a reference variable, the variable it "
+                                       "refers to is now unknown "
+                                    << loc_str(BO) << "\n";
+                goto successful_return;
             }
 
             Eval_result rhs_res{};
@@ -353,6 +430,15 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
                                   "associated VarDecl."
                                << loc_str(operand) << "\n";
                 return false;
+            }
+
+            if (is_alias_reference(VD)) {
+                // TODO: track references
+                write_through_alias_reference(VD, state, ASTctx);
+                INTERNAL_NOTE_IF(E) << " Increment / decrement through a reference variable, the "
+                                       "variable it refers to is now unknown "
+                                    << loc_str(UO) << "\n";
+                goto successful_return;
             }
 
 // temp helper macro to generate all the similar cases
@@ -614,6 +700,17 @@ bool eval_stmt(const Stmt *S, Eval_state &state, ASTContext &ASTctx) {
         // DeclStmt may have more than one decl:  int x,y=0,z;
         for (const Decl *decl : DS->decls()) {
             if (const auto *VD = dyn_cast<VarDecl>(decl)) {
+                if (is_alias_reference(VD)) {
+                    // Evaluate the initializer for its side effects, e.g. `int &r = ++x;`. The
+                    // value of the reference is not tracked atm..
+                    if (VD->hasInit()) {
+                        Eval_result res{};
+                        if (!eval_expr(res, VD->getInit(), state, ASTctx))
+                            return false;
+                    }
+                    state.all_possible_vals[VD].insert(std::nullopt);
+                    return true;
+                }
                 if (VD->hasInit()) {
                     const Expr *init = VD->getInit();
                     Eval_result res{};
