@@ -22,6 +22,10 @@ using namespace clang::ast_matchers;
 bool g_print_results = false;
 bool g_make_dot_graph = false;
 bool g_print_all_possible_vals = false;
+// Evaluate the test cases with exec_WLF() instead of exec()
+bool g_use_wlf_evaluator = false;
+// If non zero, overrides Eval_state::max_block_states
+uint64_t g_max_block_states = 0;
 
 class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
   public:
@@ -30,12 +34,18 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
     std::unordered_map<uintptr_t, std::string> names;
 
     bool exec_ret;
+    // set if the test input itself does not compile
+    bool input_has_errors = false;
 
   public:
     void run(const MatchFinder::MatchResult &Result) override {
         diags.enable_colors(true);
         diag_msg.clear();
         ASTContext &ASTctx = *Result.Context;
+
+        // Parsing is done at this point, so errors so far come from the test input. Errors
+        // reported later may come from the evaluator (report_diag).
+        input_has_errors = ASTctx.getDiagnostics().hasErrorOccurred();
 
         // the function we analyse for testing:
         const FunctionDecl *func = Result.Nodes.getNodeAs<FunctionDecl>("func");
@@ -49,7 +59,11 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
         if (g_make_dot_graph)
             evaluator.cfg->viewCFG(LangOptions());
 
-        exec_ret = evaluator.exec();
+        if (g_max_block_states != 0)
+            evaluator.main_state.max_block_states = g_max_block_states;
+
+        exec_ret = g_use_wlf_evaluator ? evaluator.exec_WLF()
+                                                                  : evaluator.exec();
 
         // After ToolInvocation the Compiler context may get freed so store the names now
         // Use the pointers as keys
@@ -94,7 +108,12 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
                                          does not take ownership..*/                               \
     const auto &test_state = test_analyzer.evaluator.main_state;                                   \
     const auto &test_names = test_analyzer.names;                                                  \
-    Invocation.run();
+    Invocation.run();                                                                              \
+    if (test_analyzer.input_has_errors) {                                                          \
+        test_pass = false;                                                                         \
+        color_msg(llvm::outs(), RED, "Test input does not compile", true, __FILE__, __LINE__)      \
+            << "\n";                                                                               \
+    }
 
 // Eval the compound statement given in string
 #define TEST_EVAL_STRING_CSTMT(str)                                                                \
@@ -130,7 +149,7 @@ inline void print_set(raw_ostream &os, const std::set<T> &set) {
 }
 
 template <typename T>
-inline bool compare_var_expect(std::string var_name, TrackedVar<T> &var_expected,
+inline bool compare_var_expect(std::string var_name, const std::set<T> &expected_values,
                                const Eval_state &state,
                                const std::unordered_map<uintptr_t, std::string> &names) {
     const auto *var_vals = get_possible_values_for_var(var_name, state, names);
@@ -149,7 +168,7 @@ inline bool compare_var_expect(std::string var_name, TrackedVar<T> &var_expected
         vars.insert(v.value());
     }
 
-    if (!(vars == var_expected.values)) {
+    if (!(vars == expected_values)) {
         return false;
     }
     return true;
@@ -165,25 +184,30 @@ inline bool compare_var_expect(std::string var_name, TrackedVar<T> &var_expected
             print_set(llvm::outs(), *a_vals);                                                      \
         }                                                                                          \
     } while (0)
-#define print_var_expect(VAR)                                                                      \
+#define print_var_expect(VAR, VALUES)                                                              \
     do {                                                                                           \
         llvm::outs() << "Var expect: `" #VAR "` = ";                                               \
-        print_set(llvm::outs(), (VAR).values);                                                     \
+        print_set(llvm::outs(), VALUES);                                                           \
     } while (0)
 
-#define COMPARE_AND_SET_TEST_PASS(VAR)                                                             \
+// Compare the possible values of the variable `VAR` in the evaluated code against the set VALUES.
+// Use when the expected values are collected from several runs of the test code, e.g. for
+// different values of an unknown variable.
+#define COMPARE_VALUES_AND_SET_TEST_PASS(VAR, VALUES)                                              \
     do {                                                                                           \
-        if (!compare_var_expect(#VAR, VAR, test_state, test_names)) {                              \
+        if (!compare_var_expect(#VAR, VALUES, test_state, test_names)) {                           \
             test_pass = false;                                                                     \
             color_msg(llvm::outs(), RED, "Results differ for var ", true, __FILE__, __LINE__)      \
                 << "`" #VAR "`\n";                                                                 \
             print_var_result(#VAR);                                                                \
-            print_var_expect(VAR);                                                                 \
+            print_var_expect(VAR, VALUES);                                                         \
         } else if (g_print_results) {                                                              \
             print_var_result(#VAR);                                                                \
-            print_var_expect(VAR);                                                                 \
+            print_var_expect(VAR, VALUES);                                                         \
         }                                                                                          \
     } while (0)
+
+#define COMPARE_AND_SET_TEST_PASS(VAR) COMPARE_VALUES_AND_SET_TEST_PASS(VAR, (VAR).values)
 
 #define TEST_CASE_BEGIN bool test_pass = true;
 
@@ -686,6 +710,49 @@ bool test_basic_switch_no_default_fallthrough() {
     TEST_CASE_END;
 }
 
+bool test_basic_switch_case_range() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // GNU case ranges `case low ... high:`, also falling through into the next case
+    TEST_EVAL_STRING_CSTMT(R"(
+    int a = -999;
+    int i = 0;
+    for(i = 0; i < 8; ++i){
+        switch(i){
+            case 0: a = 0; break;
+            case 1 ... 3: a = 100 + i; break;
+            case 4 ... 5: a = 200 + i;
+            case 6: a += 1000; break;
+            default: a = 999; break;
+        }
+    }
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-case-range"
+    TrackedVar<int> a = -999;
+    TrackedVar<int> i = 0;
+    for(i = 0; i < 8; ++i){
+        switch(i){
+            case 0: a = 0; break;
+            case 1 ... 3: a = 100 + i; break;
+            case 4 ... 5: a = 200 + i;
+            case 6: a += 1000; break;
+            default: a = 999; break;
+        }
+    }
+#pragma clang diagnostic pop
+    // clang-format on
+    /////////////////////////////////////////////
+    // Compare results
+    COMPARE_AND_SET_TEST_PASS(a);
+    COMPARE_AND_SET_TEST_PASS(i);
+
+    TEST_CASE_END;
+}
+
 bool test_basic_goto() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -870,6 +937,40 @@ bool test_int_to_bool_conversion() {
     TEST_CASE_END;
 }
 
+bool test_side_effects_with_unknown_operand() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // The side effects of the RHS must happen even if the LHS value is unknown.
+    // The comma operator's value is its RHS even if the LHS value is unknown.
+    TEST_EVAL_STRING_CSTMT(R"(
+    extern int y;
+    int i = 0;
+    int z = 0;
+    z = y + (i++);
+    z = (i++) + y;
+    int w = 0;
+    w = (z = y, 5);
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
+    int y = 0;
+    TrackedVar<int> i = 0;
+    int z = 0;
+    z = y + (i++);
+    z = (i++) + y;
+    TrackedVar<int> w = 0;
+    w = (z = y, 5);
+#pragma clang diagnostic pop
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(i);
+    COMPARE_AND_SET_TEST_PASS(w);
+
+    TEST_CASE_END;
+}
+
 bool test_lots_of_control_flow_things_1() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -974,6 +1075,143 @@ bool test_lots_of_control_flow_things_2() {
     TEST_CASE_END;
 }
 
+bool test_unknown_branch() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Our ast_eval it. exec() fails here as it gives up on the unknown condition.
+    TEST_EVAL_STRING_CSTMT(R"(
+    // y = some unknown runtime value
+    extern int y;
+    int x=0,i=0;
+    for(i=0;i<10;++i){
+        x++;
+        if(y > 0) {1+1+y;}
+    }
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Execute the same statements concretely and compare every observed value.
+    // y = some unknown runtime value
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-value"
+    int y=1;
+    TrackedVar<int> x=0,i=0;
+    for(i=0;i<10;++i){
+        x++;
+        if(y > 0) {1+1+y;}
+    }
+#pragma clang diagnostic pop
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+    COMPARE_AND_SET_TEST_PASS(i);
+
+    TEST_CASE_END;
+}
+
+bool test_unknown_ternary() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Unknown condition: both arms are possible. Known condition with an unknown
+    // arm: the result is unknown (used to throw std::bad_optional_access).
+    TEST_EVAL_STRING_CSTMT(R"(
+    extern int y;
+    int x = 0;
+    x = (y > 0) ? 5 : 7;
+    int k = 1;
+    int z = 0;
+    z = (k > 0) ? y : 1;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it, for values of the unknown `y` that take every branch
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
+    std::set<int> x_values;
+    for (int y : {0, 1}) {
+        TrackedVar<int> x = 0;
+        x = (y > 0) ? 5 : 7;
+        int k = 1;
+        int z = 0;
+        z = (k > 0) ? y : 1;
+        x_values.insert(x.values.begin(), x.values.end());
+    }
+#pragma clang diagnostic pop
+    // clang-format on
+    /////////////////////////////////////////////
+    if (!test_analyzer.exec_ret)
+        test_pass = false;
+    COMPARE_VALUES_AND_SET_TEST_PASS(x, x_values);
+
+    TEST_CASE_END;
+}
+
+bool test_unknown_LOr_LAnd_value() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // `||` / `&&` used as values with an unknown LHS (used to throw
+    // std::bad_optional_access).
+    TEST_EVAL_STRING_CSTMT(R"(
+    extern int y;
+    int i = 0;
+    int b = 0;
+    b = (y > 0) || (i > 3);
+    int c = 0;
+    c = (y > 0) && (i > 3);
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it, for values of the unknown `y` that take every branch
+    std::set<int> b_values, c_values;
+    for (int y : {0, 1}) {
+        int i = 0;
+        TrackedVar<int> b = 0;
+        b = (y > 0) || (i > 3);
+        TrackedVar<int> c = 0;
+        c = (y > 0) && (i > 3);
+        b_values.insert(b.values.begin(), b.values.end());
+        c_values.insert(c.values.begin(), c.values.end());
+    }
+    // clang-format on
+    /////////////////////////////////////////////
+    if (!test_analyzer.exec_ret)
+        test_pass = false;
+    COMPARE_VALUES_AND_SET_TEST_PASS(b, b_values);
+    COMPARE_VALUES_AND_SET_TEST_PASS(c, c_values);
+
+    TEST_CASE_END;
+}
+
+bool test_unknown_int_to_bool_cond() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Unknown int used as a condition (CK_IntegralToBoolean on an unknown
+    // value used to throw std::bad_optional_access).
+    TEST_EVAL_STRING_CSTMT(R"(
+    extern int y;
+    int x = 0;
+    if (y + 1) x = 1;
+    else x = 2;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it, for values of the unknown `y` that take every branch
+    std::set<int> x_values;
+    for (int y : {-1, 0}) {
+        TrackedVar<int> x = 0;
+        if (y + 1) x = 1;
+        else x = 2;
+        x_values.insert(x.values.begin(), x.values.end());
+    }
+    // clang-format on
+    /////////////////////////////////////////////
+    if (!test_analyzer.exec_ret)
+        test_pass = false;
+    COMPARE_VALUES_AND_SET_TEST_PASS(x, x_values);
+
+    TEST_CASE_END;
+}
+
 bool test_constexpr_func() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -1015,6 +1253,302 @@ constexpr auto func1 = [](int a){
     TEST_CASE_END;
 }
 
+bool test_division_by_zero_on_unknown_path() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // `y > 0` and `y <= 0` are both unknown, so the path with d = 0 also takes the division,
+    // which never happens in the program. It must not crash the evaluator.
+    TEST_EVAL_STRING_CSTMT(R"(
+    extern int y;
+    int d = 1;
+    if (y > 0) d = 0;
+    int x = 0;
+    if (y <= 0) x = 10 / d;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it, for values of the unknown `y` that take every branch.
+    // `x` is not compared: the evaluator also follows the path that never happens.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
+    std::set<int> d_values;
+    for (int y : {0, 1}) {
+        TrackedVar<int> d = 1;
+        if (y > 0) d = 0;
+        int x = 0;
+        if (y <= 0) x = 10 / d;
+        d_values.insert(d.values.begin(), d.values.end());
+    }
+#pragma clang diagnostic pop
+    // clang-format on
+    /////////////////////////////////////////////
+    if (!test_analyzer.exec_ret)
+        test_pass = false;
+    COMPARE_VALUES_AND_SET_TEST_PASS(d, d_values);
+
+    TEST_CASE_END;
+}
+
+bool test_switch_fallthrough() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // The case 1 block is reached from the switch (s == 1) and by falling through from case 0.
+    TEST_EVAL_STRING_CSTMT(R"(
+    int s = 0;
+    int x = 0;
+    switch(s){
+        case 0: x = 10;
+        // fall through
+        case 1: x += 1; break;
+        default: x = 30;
+    }
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+    int s = 0;
+    TrackedVar<int> x = 0;
+    switch(s){
+        case 0: x = 10;
+        // fall through
+        case 1: x += 1; break;
+        default: x = 30;
+    }
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+
+    TEST_CASE_END;
+}
+
+bool test_switch_unknown_and_case_range() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Unknown switch value: every case is possible, including no match.
+    // Known value inside a GNU case range.
+    TEST_EVAL_STRING_CSTMT(R"(
+    extern int y;
+    int x = 0;
+    switch(y){
+        case 0: x = 10; break;
+        case 1 ... 3: x = 20; break;
+    }
+    int s = 2;
+    int z = 0;
+    switch(s){
+        case 0: z = 10; break;
+        case 1 ... 3: z = 20; break;
+        default: z = 30;
+    }
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it, for values of the unknown `y` that take every case
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-case-range"
+    std::set<int> x_values, z_values;
+    for (int y : {0, 2, 5}) {
+        TrackedVar<int> x = 0;
+        switch(y){
+            case 0: x = 10; break;
+            case 1 ... 3: x = 20; break;
+        }
+        int s = 2;
+        TrackedVar<int> z = 0;
+        switch(s){
+            case 0: z = 10; break;
+            case 1 ... 3: z = 20; break;
+            default: z = 30;
+        }
+        x_values.insert(x.values.begin(), x.values.end());
+        z_values.insert(z.values.begin(), z.values.end());
+    }
+#pragma clang diagnostic pop
+    // clang-format on
+    /////////////////////////////////////////////
+    if (!test_analyzer.exec_ret)
+        test_pass = false;
+    COMPARE_VALUES_AND_SET_TEST_PASS(x, x_values);
+    COMPARE_VALUES_AND_SET_TEST_PASS(z, z_values);
+
+    TEST_CASE_END;
+}
+
+bool test_switch_in_loop() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    TEST_EVAL_STRING_CSTMT(R"(
+    int k = 0;
+    int d = 0;
+    for(d = 0; d < 4; d++){
+        switch(d){
+            case 0: k = 5; break;
+            case 2: k += 100; break;
+            case 7: k = -1; break;
+            default: k += 1;
+        }
+    }
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    TrackedVar<int> k = 0;
+    TrackedVar<int> d = 0;
+    for(d = 0; d < 4; d++){
+        switch(d){
+            case 0: k = 5; break;
+            case 2: k += 100; break;
+            case 7: k = -1; break;
+            default: k += 1;
+        }
+    }
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(k);
+    COMPARE_AND_SET_TEST_PASS(d);
+
+    TEST_CASE_END;
+}
+
+bool test_long_loop() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    TEST_EVAL_STRING_CSTMT(R"(
+    int x = 0, i = 0;
+    for(i = 0; i < 3000; ++i){ x += 2; }
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+    TrackedVar<int> x = 0, i = 0;
+    for(i = 0; i < 3000; ++i){ x += 2; }
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+    COMPARE_AND_SET_TEST_PASS(i);
+
+    TEST_CASE_END;
+}
+
+bool test_nested_loops() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    TEST_EVAL_STRING_CSTMT(R"(
+    int x = 0, i = 0, j = 0;
+    for(i = 0; i < 60; ++i)
+        for(j = 0; j < 60; ++j)
+            x++;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+    TrackedVar<int> x = 0, i = 0, j = 0;
+    for(i = 0; i < 60; ++i)
+        for(j = 0; j < 60; ++j)
+            x++;
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+    COMPARE_AND_SET_TEST_PASS(i);
+    COMPARE_AND_SET_TEST_PASS(j);
+
+    TEST_CASE_END;
+}
+
+bool test_unknown_loop_converges() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // The trip count is unknown, but the loop stops producing new states.
+    TEST_EVAL_STRING_CSTMT(R"(
+    extern int y;
+    int x = 0;
+    while (y > 0) { x = 1; y--; }
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it, for values of the unknown `y` that run the loop zero and many times
+    std::set<int> x_values;
+    for (int y : {0, 3}) {
+        TrackedVar<int> x = 0;
+        while (y > 0) { x = 1; y--; }
+        x_values.insert(x.values.begin(), x.values.end());
+    }
+    // clang-format on
+    /////////////////////////////////////////////
+    if (!test_analyzer.exec_ret || !test_state.eval_succeeded)
+        test_pass = false;
+    COMPARE_VALUES_AND_SET_TEST_PASS(x, x_values);
+
+    TEST_CASE_END;
+}
+
+bool test_constexpr_func_unknown_branch() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // The callee is evaluated with the worklist too: the branch on the unknown argument `b`
+    // returns the same value on both paths.
+    TEST_EVAL_STRING_TOPLVL(R"(
+constexpr int func1(int a, int b){
+    int r = a;
+    if (b > 0) r = a;
+    return r + 2;
+}
+extern int y;
+void test(){
+    int x = 0;
+    for(int i = 0; i < 3; ++i){
+        x = func1(i, y);
+    }
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+// use a lambda so we can keep it contained in the test function ...
+// constexpr int func1(int a, int b){
+constexpr auto func1 = [](int a, int b){
+    int r = a;
+    if (b > 0) r = a;
+    return r + 2;
+};
+// extern int y;
+int y = 0;
+//void test(){
+    TrackedVar<int> x = 0;
+    for(int i = 0; i < 3; ++i){
+        x = func1(i, y);
+    }
+//}
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+
+    TEST_CASE_END;
+}
+
+////////////////////////////////////////////////////////
+// test things that should fail exec_WLF
+
+bool test_should_fail_max_block_states() {
+    TEST_CASE_BEGIN;
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-variable"
+    /////////////////////////////////////////////
+    // A known loop with more iterations than the configured limit
+    g_max_block_states = 20;
+    TEST_EVAL_STRING_CSTMT(R"(
+    int x = 0;
+    for(int i = 0; i < 50; ++i){ x++; }
+    )")
+    g_max_block_states = 0;
+#pragma clang diagnostic pop
+
+    if (test_analyzer.exec_ret || test_state.eval_succeeded)
+        test_pass = false;
+
+    TEST_CASE_END;
+}
+
 ////////////////////////////////////////////////////////
 // test things that should fail exec
 
@@ -1036,7 +1570,7 @@ void test(int unknown){
     )")
 #pragma clang diagnostic pop
 
-    if (test_analyzer.exec_ret)
+    if (test_analyzer.exec_ret || test_state.eval_succeeded)
         test_pass = false;
 
     TEST_CASE_END;
@@ -1075,6 +1609,9 @@ static std::vector<test_func> test_cases = {
     test_basic_switch,
     test_basic_switch_no_default,
     test_basic_switch_no_default_fallthrough,
+    test_basic_switch_case_range,
+    test_switch_fallthrough,
+    test_switch_in_loop,
 
     // goto
     test_basic_goto,
@@ -1087,6 +1624,9 @@ static std::vector<test_func> test_cases = {
     // ternary
     test_basic_ternary,
 
+    // side effects
+    test_side_effects_with_unknown_operand,
+
     // implicit conversions
     test_int_to_bool_conversion,
 
@@ -1094,15 +1634,41 @@ static std::vector<test_func> test_cases = {
     test_lots_of_control_flow_things_1,
     test_lots_of_control_flow_things_2,
 
+    // unknown condition, fails with exec()
+    test_unknown_branch,
 
     // calling constexpr functions
     test_constexpr_func,
-    
-    // should fail 
+
+    // should fail
     test_should_fail_1,
 
     // weird stuff
     // test_Lor_in_switch,
+    // clang-format on
+};
+
+// Run only with exec_WLF(): exec() gives up on unknown conditions, stops evaluating a loop after
+// MAX_BLOCK_VISITS visits of a block and does not use Eval_state::max_block_states.
+static std::vector<test_func> wlf_test_cases = {
+    // clang-format off
+    // unknown conditions
+    test_unknown_ternary,
+    test_unknown_LOr_LAnd_value,
+    test_unknown_int_to_bool_cond,
+    test_division_by_zero_on_unknown_path,
+    test_switch_unknown_and_case_range,
+
+    // long loops
+    test_long_loop,
+    test_nested_loops,
+    test_unknown_loop_converges,
+
+    // calling constexpr functions
+    test_constexpr_func_unknown_branch,
+
+    // should fail
+    test_should_fail_max_block_states,
     // clang-format on
 };
 
@@ -1113,17 +1679,29 @@ int main(int argc, char **argv) {
     if (argc > 1)
         g_print_results = true;
 
+    // Run test_cases with exec(), then test_cases and wlf_test_cases with exec_WLF()
     int n_failed = 0;
-    for (auto test_case : test_cases) {
-        if (!test_case())
-            n_failed++;
+    size_t n_runs = 0;
+    for (bool use_wlf : {false, true}) {
+        g_use_wlf_evaluator = use_wlf;
+        llvm::outs() << "========== Running test cases with "
+                     << (use_wlf ? "exec_WLF()" : "exec()") << " ==========\n";
+        std::vector<test_func> cases = test_cases;
+        if (use_wlf)
+            cases.insert(cases.end(), wlf_test_cases.begin(), wlf_test_cases.end());
+        for (auto test_case : cases) {
+            if (!test_case())
+                n_failed++;
+            n_runs++;
+        }
     }
+    g_use_wlf_evaluator = false;
 
     if (n_failed != 0) {
-        llvm::outs() << "Test statistics: " << n_failed << " / " << test_cases.size();
+        llvm::outs() << "Test statistics: " << n_failed << " / " << n_runs;
         color_msg(llvm::outs(), RED, " test cases failed.\n");
     } else {
-        llvm::outs() << "Test statistics: " << n_failed << " / " << test_cases.size()
+        llvm::outs() << "Test statistics: " << n_failed << " / " << n_runs
                      << " test cases failed.\n";
         color_msg(llvm::outs(), GREEN, " All test cases passed.\n");
     }
@@ -1138,11 +1716,10 @@ int main(int argc, char **argv) {
 #include "clang/Tooling/CommonOptionsParser.h"
 static cl::OptionCategory LoopVarTrackerOpts("LoopVarTrackerOpts options");
 
-static cl::opt<bool> make_dot_graph(
-    "dot",                                  // The flag name
-    cl::desc("Make .dot graph from CFG."),  // Description for --help
-    cl::init(false),                        // Default value
-    cl::cat(LoopVarTrackerOpts)             // Associate with your category
+static cl::opt<bool> make_dot_graph("dot",                                 // The flag name
+                                    cl::desc("Make .dot graph from CFG."), // Description for --help
+                                    cl::init(false),                       // Default value
+                                    cl::cat(LoopVarTrackerOpts) // Associate with your category
 );
 
 int main(int argc, const char **argv) {
@@ -1160,7 +1737,8 @@ int main(int argc, const char **argv) {
 
     g_print_results = false;
     g_print_all_possible_vals = true;
-    if(make_dot_graph) g_make_dot_graph = true;
+    if (make_dot_graph)
+        g_make_dot_graph = true;
 
     return Tool.run(newFrontendActionFactory(&Finder).get());
 }

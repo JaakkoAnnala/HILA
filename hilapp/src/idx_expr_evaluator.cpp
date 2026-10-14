@@ -3,6 +3,11 @@
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/ParentMapContext.h>
 
+#include <llvm/ADT/Hashing.h>
+
+#include <limits>
+#include <unordered_set>
+
 using namespace clang;
 using namespace llvm;
 
@@ -67,6 +72,8 @@ void report_diag(const ASTContext &ctx, DiagnosticsEngine::Level lev, const Sour
 bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx);
 bool eval_stmt(const Stmt *S, Eval_state &state, ASTContext &ASTctx);
 bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext &ASTctx);
+static bool eval_constexpr_function_WLF(const FunctionDecl *func, Eval_state &state,
+                                        ASTContext &ASTctx);
 
 // Helper that adds the result of Expr E to the state.possible_vals_for_expr
 // if we are tracking the Expr E
@@ -182,6 +189,8 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             if (!rhs_res.val.has_value()) {
                 state.vars[VD] = std::nullopt;
                 result.val = std::nullopt;
+                // var changes, record that it may be unknown
+                state.all_possible_vals[VD].insert(state.vars[VD]);
                 goto successful_return;
             }
 
@@ -232,19 +241,19 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             //// [C99 6.5.13] Logical AND operator.
             //// [C99 6.5.14] Logical OR operator.
             if (op == BO_LAnd || op == BO_LOr) {
-                result.val = state.last_res.val.value();
+                // We can reach this with an unknown last_res, so dont try to get a concrete value
+                // out of the std::optional here.
+                result.val = state.last_res.val;
                 goto successful_return;
             }
 
-            // LHS evaluated first
+            // LHS evaluated first. Evaluate both before checking for unknown values: the side
+            // effects of the RHS (e.g. `y + (i++)`) happen even if the LHS value is unknown.
             Eval_result lhs_res{};
             if (!eval_expr(lhs_res, LHS, state, ASTctx))
                 return false;
-            if (!lhs_res.val.has_value())
-                goto successful_return; // We dont know the values just return the nullopt
 
             Eval_result rhs_res{};
-
             if (!eval_expr(rhs_res, RHS, state, ASTctx))
                 return false;
 
@@ -260,6 +269,16 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
 
             if (!lhs_res.val.has_value() || !rhs_res.val.has_value())
                 goto successful_return; // We dont know the values just return the nullopt
+
+            if ((op == BO_Div || op == BO_Rem) &&
+                (rhs_res.val.value() == 0 ||
+                 (rhs_res.val.value() == -1 &&
+                  lhs_res.val.value() == std::numeric_limits<int64_t>::min()))) {
+                // Undefined behaviour...
+                INTERNAL_NOTE_IF(E) << "Division by zero or overflow, the result is unknown "
+                                    << loc_str(BO) << "\n";
+                goto successful_return;
+            }
 
             switch (op) {
 
@@ -399,8 +418,9 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         }
     } else if (dyn_cast<ConditionalOperator>(E)) {
         // this is the ternary op (x?a:b)
-        // Similarly as the short circuiting for LAnd/LOr, the result is the last evaluated expression.
-        result.val = state.last_res.val.value();
+        // Similarly as the short circuiting for LAnd/LOr, the result is the last evaluated
+        // expression. We can reach this with an unknown last_res.
+        result.val = state.last_res.val;
         goto successful_return;
 
     } else if (const auto *SCE = dyn_cast<CXXStaticCastExpr>(E)) {
@@ -416,7 +436,8 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         const auto *func = CE->getDirectCallee();
 
         bool do_eval = true;
-        if (!func->isConstexpr()) {
+        // func is nullptr for calls through a function pointer
+        if (!func || !func->isConstexpr()) {
 
             INTERNAL_NOTE_IF(E) << "Call to a function that is not a constexpr " << loc_str(CE)
                                 << "\n";
@@ -442,7 +463,10 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
                 return false;
             if (do_eval) {
                 auto vd = dyn_cast<VarDecl>(func->parameters()[i]);
-                call_state.vars[vd] = arg_val.val.value();
+                // A worklist path may reach a constexpr call with an unknown
+                // argument. Preserve that fact in the callee instead of
+                // throwing std::bad_optional_access here.
+                call_state.vars[vd] = arg_val.val;
             }
             i++;
         }
@@ -454,17 +478,34 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
                 return false;
             }
 
-            // Build CFG for the function
-            CFG::BuildOptions CFG_BO;
-            auto CFG = CFG::buildCFG(func, func_body, &ASTctx, CFG_BO);
-            auto entry_block = CFG->getEntry();
-            auto exit_block = CFG->getExit();
-            call_state.exit_block = &exit_block;
-            // eval the call
-            if (!eval_CFG_block(entry_block, call_state, ASTctx))
+            if (state.call_depth >= MAX_CALL_DEPTH) {
+                INTERNAL_ERROR << " constexpr function calls nested deeper than " << MAX_CALL_DEPTH
+                               << ", giving up. " << loc_str(CE) << "\n";
                 return false;
+            }
+            call_state.call_depth = state.call_depth + 1;
 
-            result.val = call_state.return_val.value();
+            if (state.use_worklist) {
+                // Use the same worklist traversal as exec_WLF() for the callee.
+                call_state.use_worklist = true;
+                call_state.max_block_states = state.max_block_states;
+                call_state.func_cache = state.func_cache;
+                if (!eval_constexpr_function_WLF(func, call_state, ASTctx))
+                    return false;
+            } else {
+                // The legacy evaluator retains its recursive CFG traversal.
+                CFG::BuildOptions CFG_BO;
+                auto CFG = CFG::buildCFG(func, func_body, &ASTctx, CFG_BO);
+                auto entry_block = CFG->getEntry();
+                auto exit_block = CFG->getExit();
+                call_state.exit_block = &exit_block;
+                if (!eval_CFG_block(entry_block, call_state, ASTctx))
+                    return false;
+            }
+
+            // The callee can execute successfully while still having an
+            // unknown return value (when argument is unknown)
+            result.val = call_state.return_val;
             goto successful_return;
         }
         goto successful_return;
@@ -655,11 +696,11 @@ bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx
         }
         CFGBlock *s0 = succ[0]; // this is a cast, succ[0] is actually an AdjacentBlock
         return eval_CFG_block(*s0, state, ASTctx);
-    } else if (dyn_cast<IfStmt>(trm_stmt)            //
-               || dyn_cast<ForStmt>(trm_stmt)        //
-               || dyn_cast<WhileStmt>(trm_stmt)      //
-               || dyn_cast<DoStmt>(trm_stmt)         //
-               || dyn_cast<BinaryOperator>(trm_stmt) //
+    } else if (dyn_cast<IfStmt>(trm_stmt)                 //
+               || dyn_cast<ForStmt>(trm_stmt)             //
+               || dyn_cast<WhileStmt>(trm_stmt)           //
+               || dyn_cast<DoStmt>(trm_stmt)              //
+               || dyn_cast<BinaryOperator>(trm_stmt)      //
                || dyn_cast<ConditionalOperator>(trm_stmt) //
     ) {
         if (block.succ_size() != 2) {
@@ -714,14 +755,18 @@ bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx
             } else if (auto cs = dyn_cast<CaseStmt>(case_label_stmt)) {
 
                 auto case_val_expr = cs->getLHS();
-                Expr::EvalResult result;
-                if (!case_val_expr->EvaluateAsConstantExpr(result, ASTctx)) {
+                Expr::EvalResult result, result_rhs;
+                if (!case_val_expr->EvaluateAsConstantExpr(result, ASTctx) ||
+                    (cs->getRHS() && !cs->getRHS()->EvaluateAsConstantExpr(result_rhs, ASTctx))) {
                     // probably not valid c++ and should not happen
                     INTERNAL_ERROR << " the case label is not an constant expression"
                                    << loc_str(case_val_expr) << "\n";
                     return false;
                 }
-                uint64_t case_val = result.Val.getInt().getExtValue();
+                // GNU case ranges `case 1 ... 3:` have a RHS
+                const int64_t case_low = result.Val.getInt().getExtValue();
+                const int64_t case_high =
+                    cs->getRHS() ? result_rhs.Val.getInt().getExtValue() : case_low;
                 if (!cond_res.val.has_value()) {
                     INTERNAL_ERROR << " Could not determine the value of the switch variable. "
                                       "Cant follow the control flow correctly. Giving up. "
@@ -733,7 +778,7 @@ bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx
                                 "Cant follow the control flow correctly. Giving up. ");
                     return false;
                 }
-                if ((uint64_t)cond_res.val.value() == case_val) {
+                if (case_low <= cond_res.val.value() && cond_res.val.value() <= case_high) {
                     return eval_CFG_block(*case_block, state, ASTctx);
                 }
 
@@ -980,4 +1025,325 @@ bool debug_print_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext 
             ret = false;
     }
     return ret;
+}
+
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// Worklist fixpoint CFG traversal
+//
+// The worklist holds (block, state) pairs. Popping a pair that
+// has not been seen at that block before evaluates the block from that state and pushes the
+// resulting state to each successor the terminator can take: a known condition or switch value
+// selects one successor, an unknown one all of them. A pair already seen at its block is
+// skipped, so each (block, state) pair is evaluated exactly once.
+//
+// This reaches the least fixpoint of the dataflow equations
+//     states(entry) = { initial state }
+//     states(B) = union over predecessors P of transfer(P -> B, states(P))
+// over the lattice of sets of states (join = set union, states are never merged). It is
+// Kildall's algorithm, but as each state is evaluated independently (the transfer distributes
+// over the union), only newly reached states are evaluated instead of re-evaluating a block
+// for all its states on every visit. The result does not depend on the worklist order. Loops
+// end when their iterations stop producing new states. At the end states(B) holds every state
+// reaching B, and possible_vals_for_expr / all_possible_vals every value observed on the way.
+//
+// We do no widening, since merging states would make the results not exact.
+// To terminate eg unknown loop bounds there are fixed limits on how many times CFG blocks are
+// visited. Exceeding a limit stops the evaluation with a failure
+//  - Eval_state::max_block_states (default DEFAULT_MAX_BLOCK_STATES): maximum number of
+//    distinct states entering one CFG block.
+//  - MAX_CALL_DEPTH: maximum depth of nested constexpr function calls
+
+// The state of one execution path at a CFG block boundary
+struct Path_eval_state {
+    std::unordered_map<const VarDecl *, std::optional<int64_t>> vars;
+    // The value of the last evaluated expression. Needed when a block starts with an `&&`, `||` or
+    // `?:` whose value was decided in the predecessor block, see eval_expr().
+    std::optional<int64_t> last_res;
+    std::optional<int64_t> return_val;
+
+    bool operator==(const Path_eval_state &other) const {
+        return vars == other.vars && last_res == other.last_res && return_val == other.return_val;
+    }
+};
+
+// hashing Path_eval_state so we can use it in unordered_set
+// and quickly check if a state has been encountered
+struct Path_eval_state_hash {
+    size_t operator()(const Path_eval_state &p) const {
+        // vars is unordered, so combine its entries with an order independent sum.
+        size_t vars_hash = 0;
+        for (const auto &[decl, value] : p.vars)
+            vars_hash += hash_combine(decl, value.has_value(), value.value_or(0));
+        return hash_combine(vars_hash, p.last_res.has_value(), p.last_res.value_or(0),
+                            p.return_val.has_value(), p.return_val.value_or(0));
+    }
+};
+
+using Path_set = std::unordered_set<Path_eval_state, Path_eval_state_hash>;
+
+static Path_eval_state merge_paths(const Path_eval_state &a, const Path_eval_state &b) {
+    Path_eval_state merged;
+    for (const auto &[decl, value] : a.vars) {
+        const auto it = b.vars.find(decl);
+        if (it != b.vars.end() && it->second == value)
+            merged.vars.emplace(decl, value);
+        else
+            merged.vars.emplace(
+                decl, std::nullopt); // variables (and the return value) that differ become unknown
+    }
+    for (const auto &[decl, value] : b.vars) {
+        if (a.vars.find(decl) == a.vars.end())
+            merged.vars.emplace(decl, std::nullopt);
+    }
+    if (a.return_val == b.return_val)
+        merged.return_val = a.return_val;
+    return merged;
+}
+
+static std::string block_loc_str(const CFGBlock &block, ASTContext &ASTctx) {
+    if (const Stmt *terminator = block.getTerminatorStmt())
+        return loc_str(terminator);
+    for (const CFGElement &element : block) {
+        if (const auto cfg_stmt = element.getAs<CFGStmt>())
+            return loc_str(cfg_stmt->getStmt());
+    }
+    return "<unknown location>";
+}
+
+// Evaluate all execution paths through `cfg`, starting with the variable values in state.vars.
+// Observed values are recorded in state.possible_vals_for_expr and state.all_possible_vals.
+// On success state.vars and state.return_val are the merge of all paths reaching the exit.
+// Returns false (and stops) if something can not be evaluated, or if more than
+// state.max_block_states distinct states reach a block.
+static bool eval_CFG_worklist(const CFG &cfg, Eval_state &state, ASTContext &ASTctx) {
+    std::unordered_map<const CFGBlock *, Path_set> seen;
+    Path_set exit_paths;
+    // Used as a stack: finishes one path before starting the others, which keeps it short.
+    std::vector<std::pair<const CFGBlock *, Path_eval_state>> worklist;
+
+    const auto push = [&](const CFGBlock *succ, Path_eval_state path) {
+        if (succ != nullptr) // nullptr is an unreachable successor
+            worklist.emplace_back(succ, std::move(path));
+    };
+
+    Path_eval_state initial;
+    initial.vars = std::move(state.vars);
+    push(&cfg.getEntry(), std::move(initial));
+
+    while (!worklist.empty()) {
+        const CFGBlock *block = worklist.back().first;
+        Path_eval_state path = std::move(worklist.back().second);
+        worklist.pop_back();
+
+        Path_set &block_seen = seen[block];
+        if (block_seen.find(path) != block_seen.end())
+            continue; // this path has already been explored from here on
+        if (block_seen.size() >= state.max_block_states) {
+            INTERNAL_ERROR << "More than " << state.max_block_states
+                           << " different states reach the same CFG block (e.g. a loop with an "
+                              "unknown or too large bound), giving up. "
+                           << block_loc_str(*block, ASTctx) << "\n";
+            return false;
+        }
+        block_seen.insert(path);
+
+        if (block == &cfg.getExit()) {
+            exit_paths.insert(std::move(path));
+            continue;
+        }
+
+        // Evaluate the block. The block_expr_state cache is only valid within one block
+        state.vars = std::move(path.vars);
+        state.last_res.val = path.last_res;
+        state.return_val = path.return_val;
+        state.block_expr_state.clear();
+        for (const CFGElement &element : *block) {
+            if (const auto cfg_stmt = element.getAs<CFGStmt>()) {
+                if (!eval_stmt(cfg_stmt->getStmt(), state, ASTctx))
+                    return false;
+            } else if (element.getAs<CFGScopeBegin>() || element.getAs<CFGScopeEnd>() ||
+                       element.getAs<CFGLifetimeEnds>() || element.getAs<CFGLoopExit>()) {
+                // skip blocks (markers) that do not execute any code
+            } else {
+                INTERNAL_ERROR << " Unhandled CFGElement Kind " << element.getKind()
+                               << " in CFG block at " << block_loc_str(*block, ASTctx) << "\n";
+                return false;
+            }
+        }
+
+        Path_eval_state next;
+        next.vars = std::move(state.vars);
+        next.last_res = state.last_res.val;
+        next.return_val = state.return_val;
+
+        // Get the value of the terminator condition. Prioritise the conditions own cached value
+        // over last_res, which may come from a later element in the block. The condition is not
+        // cached when it is not evaluated in this block, eg the whole `a && b` of `if (a && b)`:
+        // the block branching on it evaluates `b`, so last_res is the right value there
+        const auto condition_value = [&]() -> std::optional<int64_t> {
+            if (const auto *cond = dyn_cast_or_null<Expr>(block->getTerminatorCondition())) {
+                const auto it = state.block_expr_state.find(cond);
+                if (it != state.block_expr_state.end())
+                    return it->second;
+            }
+            return state.last_res.val;
+        };
+
+        // Pick the successors. We depend on the successor ordering defined by CFGBlock, see the
+        // comment above class CFGBlock in CFG.h in llvm sources.
+        const Stmt *trm_stmt = block->getTerminatorStmt();
+        if (trm_stmt == nullptr || isa<BreakStmt, ContinueStmt, GotoStmt>(trm_stmt)) {
+            // Only one successor, or none at the end of the function
+            for (const CFGBlock *succ : block->succs())
+                push(succ, next);
+
+        } else if (isa<IfStmt, ForStmt, WhileStmt, DoStmt, BinaryOperator, ConditionalOperator>(
+                       trm_stmt)) {
+            if (block->succ_size() != 2) {
+                INTERNAL_ERROR << "Expected block[" << block->getBlockID()
+                               << "] to have 2 successors but it has succ_size "
+                               << block->succ_size() << " terminator StmtClass: `"
+                               << trm_stmt->getStmtClassName() << "` \n";
+                return false;
+            }
+            if (const auto *BO = dyn_cast<BinaryOperator>(trm_stmt)) {
+                if (!(BO->getOpcode() == BO_LAnd || BO->getOpcode() == BO_LOr)) {
+                    // Unreachable
+                    INTERNAL_ERROR << "Expected terminator StmtClass: `BinaryOperator` to have "
+                                      "Opcode BO_LAnd or BO_LOr but found "
+                                   << BO->getOpcodeStr() << loc_str(trm_stmt) << "\n";
+                    return false;
+                }
+            }
+            // succ[0] is the true branch, succ[1] the false branch 
+            // Unknown condition value follows both branches
+            const std::optional<int64_t> cond = condition_value();
+            for (const bool branch : {true, false}) {
+                if (cond.has_value() && static_cast<bool>(cond.value()) != branch)
+                    continue;
+                Path_eval_state taken = next;
+                // Taking this branch means the condition evaluated to `branch`. This is also the
+                // value of a short circuited `&&` / `||` used as a value in the successor block
+                taken.last_res = branch;
+                push(block->succ_begin()[branch ? 0 : 1], std::move(taken));
+            }
+
+        } else if (isa<SwitchStmt>(trm_stmt)) {
+            // One successor for each case label. The last successor is the `default:` block, or
+            // the block after the switch if there is no default label
+            const std::optional<int64_t> value = condition_value();
+            if (!value.has_value()) {
+                // Any case is possible
+                for (const CFGBlock *succ : block->succs())
+                    push(succ, next);
+            } else {
+                const CFGBlock *selected = block->succ_rbegin()->getReachableBlock();
+                for (const CFGBlock::AdjacentBlock &succ : block->succs()) {
+                    // Look at the label also if the block is unreachable, then only
+                    // getPossiblyUnreachableBlock() is set
+                    const CFGBlock *succ_block = succ.getReachableBlock()
+                                                     ? succ.getReachableBlock()
+                                                     : succ.getPossiblyUnreachableBlock();
+                    const auto *case_stmt =
+                        succ_block ? dyn_cast_or_null<CaseStmt>(succ_block->getLabel()) : nullptr;
+                    if (!case_stmt)
+                        continue;
+                    Expr::EvalResult lhs, rhs;
+                    if (!case_stmt->getLHS()->EvaluateAsInt(lhs, ASTctx) ||
+                        (case_stmt->getRHS() && !case_stmt->getRHS()->EvaluateAsInt(rhs, ASTctx))) {
+                        // probably not valid c++ and should not happen
+                        INTERNAL_ERROR << " the case label is not an constant expression "
+                                       << loc_str(case_stmt) << "\n";
+                        return false;
+                    }
+                    // support GNU extension for fun, GNU case ranges `case 1 ... 3:` have a RHS
+                    const int64_t low = lhs.Val.getInt().getExtValue();
+                    const int64_t high = case_stmt->getRHS() ? rhs.Val.getInt().getExtValue() : low;
+                    if (low <= value.value() && value.value() <= high) {
+                        selected = succ.getReachableBlock();
+                        break;
+                    }
+                }
+                push(selected, std::move(next));
+            }
+
+        } else {
+            INTERNAL_ERROR << " TODO: Unhandeled terminatorStmt class " << loc_str(trm_stmt)
+                           << " : " << trm_stmt->getStmtClassName() << "\n";
+            return false;
+        }
+    }
+
+    state.block_expr_state.clear();
+    state.vars.clear();
+    state.return_val = std::nullopt;
+    if (!exit_paths.empty()) {
+        // Publish the merged state at the exit: the API has one value per variable, so differing
+        // exit paths become unknown there. All observed values remain in all_possible_vals.
+        auto it = exit_paths.begin();
+        Path_eval_state merged = *it;
+        for (++it; it != exit_paths.end(); ++it)
+            merged = merge_paths(merged, *it);
+        state.vars = std::move(merged.vars);
+        state.return_val = merged.return_val;
+    }
+    return true;
+}
+
+// Evaluate a constexpr function called during exec_WLF() with the same worklist traversal.
+// state.vars holds the argument values, the result is in state.return_val.
+static bool eval_constexpr_function_WLF(const FunctionDecl *func, Eval_state &state,
+                                        ASTContext &ASTctx) {
+    Function_eval_cache *cache = state.func_cache;
+
+    // The callee does not track any expressions and its variables are not reported, so the
+    // return value is all we need from an earlier call with the same arguments.
+    std::vector<std::optional<int64_t>> args;
+    if (cache) {
+        for (const ParmVarDecl *param : func->parameters()) {
+            const auto it = state.vars.find(param);
+            args.push_back(it != state.vars.end() ? it->second : std::nullopt);
+        }
+        const auto memo = cache->return_vals.find({func, args});
+        if (memo != cache->return_vals.end()) {
+            state.return_val = memo->second;
+            return true;
+        }
+    }
+
+    std::unique_ptr<CFG> uncached_cfg;
+    std::unique_ptr<CFG> &func_cfg = cache ? cache->cfgs[func] : uncached_cfg;
+    if (!func_cfg) {
+        CFG::BuildOptions CFG_opts;
+        func_cfg = CFG::buildCFG(func, func->getBody(), &ASTctx, CFG_opts);
+        if (!func_cfg) {
+            INTERNAL_ERROR << " Could not build a CFG for constexpr function " << loc_str(func)
+                           << "\n";
+            return false;
+        }
+    }
+
+    if (!eval_CFG_worklist(*func_cfg, state, ASTctx))
+        return false;
+
+    if (cache)
+        cache->return_vals.emplace(std::make_pair(func, std::move(args)), state.return_val);
+    return true;
+}
+
+bool Idx_expr_evaluator::exec_WLF() {
+    assert(cfg != nullptr);
+    assert(ASTctx != nullptr);
+
+    // Clear prior results while retaining the registered expression keys.
+    main_state.vars.clear();
+    main_state.all_possible_vals.clear();
+    for (auto &[expr, values] : main_state.possible_vals_for_expr)
+        values.clear();
+
+    main_state.use_worklist = true;
+    main_state.func_cache = &func_cache;
+    main_state.eval_succeeded = eval_CFG_worklist(*cfg, main_state, *ASTctx);
+    return main_state.eval_succeeded;
 }
