@@ -403,19 +403,10 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         const auto *e = SCE->getSubExpr()->IgnoreImpCasts();
         if (!eval_expr(result, e, state, ASTctx))
             return false;
-        goto successful_return;
-    } else if (const auto *IC = dyn_cast<ImplicitCastExpr>(E)) {
-        // TODO: Interpret Implicit casts as a nop.. This might not be correct..
-        if (!eval_expr(result, IC->IgnoreImpCasts(), state, ASTctx))
-            return false;
-
-        if (IC->getCastKind() == CK_IntegralToBoolean) {
+        if (SCE->getCastKind() == CK_IntegralToBoolean && result.val.has_value())
             result.val = (bool)result.val.value();
-        } else {
-            INTERNAL_NOTE << "Ignoring implicit cast " << IC->getCastKindName() << "\n";
-        }
-
         goto successful_return;
+
     } else if (const auto *CE = dyn_cast<CallExpr>(E)) {
         const auto *func = CE->getDirectCallee();
 
