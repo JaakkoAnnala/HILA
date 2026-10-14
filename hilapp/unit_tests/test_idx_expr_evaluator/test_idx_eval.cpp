@@ -1177,7 +1177,7 @@ void test(){
     TEST_CASE_END;
 }
 
-bool test_reference_variable() {
+bool test_ref_variable() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
     // Assigning through a reference variable changes `x`
@@ -1200,6 +1200,77 @@ bool test_reference_variable() {
     /////////////////////////////////////////////
     COMPARE_AND_SET_TEST_PASS(x);
     COMPARE_AND_SET_TEST_PASS(y);
+
+    TEST_CASE_END;
+}
+
+bool test_ref_variable_chains() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // A reference to a reference, a write to `x` read through `r`, a reference bound to the result
+    // of `++x`, and a const reference bound to a temporary, which keeps its value.
+    TEST_EVAL_STRING_CSTMT(R"(
+    int x = 0;
+    int &r = x;
+    int &r2 = r;
+    r2 += 2;
+    x = 7;
+    int y = 0;
+    y = r;
+    int &r3 = ++x;
+    r3 *= 2;
+    const int &t = x + 1;
+    x = 0;
+    int z = 0;
+    z = t;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+    TrackedVar<int> x = 0;
+    TrackedVar<int> &r = x;
+    TrackedVar<int> &r2 = r;
+    r2 += 2;
+    x = 7;
+    TrackedVar<int> y = 0;
+    y = r;
+    TrackedVar<int> &r3 = ++x;
+    r3 *= 2;
+    const int &t = x + 1;
+    x = 0;
+    TrackedVar<int> z = 0;
+    z = t;
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+    COMPARE_AND_SET_TEST_PASS(y);
+    COMPARE_AND_SET_TEST_PASS(z);
+
+    TEST_CASE_END;
+}
+
+bool test_ref_variable_unknown_target() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // The variable `r` refers to is not determined from its initializer, so a write through it may
+    // change any variable: they all become unknown.
+    TEST_EVAL_STRING_CSTMT(R"(
+    int c = 1;
+    int x = 0;
+    int z = 0;
+    int &r = c ? x : z;
+    r = 5;
+    int a = 0;
+    a = x;
+    )")
+    /////////////////////////////////////////////
+    // The evaluator does not track this precisely, so the values can not be compared.
+    /////////////////////////////////////////////
+    if (!test_analyzer.exec_ret)
+        test_pass = false;
+    EXPECT_UNKNOWN_AND_SET_TEST_PASS(x);
+    EXPECT_UNKNOWN_AND_SET_TEST_PASS(z);
+    EXPECT_UNKNOWN_AND_SET_TEST_PASS(a);
 
     TEST_CASE_END;
 }
@@ -1865,7 +1936,9 @@ static std::vector<test_func> test_cases = {
     test_ref_arg_unknown_function,
     test_ref_arg_constexpr_function,
     test_ref_arg_constructor,
-    test_reference_variable,
+    test_ref_variable,
+    test_ref_variable_chains,
+    test_ref_variable_unknown_target,
 
     // implicit conversions
     test_int_to_bool_conversion,
