@@ -24,8 +24,6 @@ using namespace clang::ast_matchers;
 int g_verbosity = 0;
 bool g_make_dot_graph = false;
 bool g_print_all_possible_vals = false;
-// Evaluate the test cases with exec_WLF() instead of exec()
-bool g_use_wlf_evaluator = false;
 // If non zero, overrides Eval_state::max_block_states
 uint64_t g_max_block_states = 0;
 
@@ -119,7 +117,7 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
         if (g_max_block_states != 0)
             evaluator.main_state.max_block_states = g_max_block_states;
 
-        exec_ret = g_use_wlf_evaluator ? evaluator.exec_WLF() : evaluator.exec();
+        exec_ret = evaluator.exec();
 
         // After ToolInvocation the Compiler context may get freed so store the names now
         // Use the pointers as keys
@@ -1382,7 +1380,7 @@ bool test_lots_of_control_flow_things_2() {
 bool test_unknown_branch() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
-    // Our ast_eval it. exec() fails here as it gives up on the unknown condition.
+    // Our ast_eval it
     TEST_EVAL_STRING_CSTMT(R"(
     // y = some unknown runtime value
     extern int y;
@@ -1830,6 +1828,44 @@ struct Sub {
     TEST_CASE_END;
 }
 
+bool test_constexpr_variadic_func() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // A C-style variadic function has more arguments than parameters. The extra arguments are
+    // only evaluated for their side effects.
+    TEST_EVAL_STRING_TOPLVL(R"(
+constexpr int f(int a, ...){
+    return a + 2;
+}
+void test(){
+    int x = 0;
+    int i = 0;
+    x = f(5, i++, 3);
+    x = f(i);
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+// use a lambda so we can keep it contained in the test function ...
+// constexpr int f(int a, ...){
+constexpr auto f = [](int a, ...){
+    return a + 2;
+};
+//void test(){
+    TrackedVar<int> x = 0;
+    TrackedVar<int> i = 0;
+    x = f(5, i++, 3);
+    x = f(i);
+//}
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+    COMPARE_AND_SET_TEST_PASS(i);
+
+    TEST_CASE_END;
+}
+
 bool test_constexpr_func_unknown_branch() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -1875,7 +1911,7 @@ int y = 0;
 }
 
 ////////////////////////////////////////////////////////
-// test things that should fail exec_WLF
+// test things that should fail exec: limits
 
 bool test_should_fail_max_block_states() {
     TEST_CASE_BEGIN;
@@ -1992,26 +2028,8 @@ static std::vector<test_func> test_cases = {
     test_lots_of_control_flow_things_1,
     test_lots_of_control_flow_things_2,
 
-    // unknown condition, fails with exec()
-    test_unknown_branch,
-
-    // calling constexpr functions
-    test_constexpr_func,
-    test_constexpr_member_operator_call,
-
-    // should fail
-    test_should_fail_1,
-
-    // weird stuff
-    // test_Lor_in_switch,
-    // clang-format on
-};
-
-// Run only with exec_WLF(): exec() gives up on unknown conditions, stops evaluating a loop after
-// MAX_BLOCK_VISITS visits of a block and does not use Eval_state::max_block_states.
-static std::vector<test_func> wlf_test_cases = {
-    // clang-format off
     // unknown conditions
+    test_unknown_branch,
     test_unknown_ternary,
     test_unknown_LOr_LAnd_value,
     test_unknown_int_to_bool_cond,
@@ -2024,10 +2042,17 @@ static std::vector<test_func> wlf_test_cases = {
     test_unknown_loop_converges,
 
     // calling constexpr functions
+    test_constexpr_func,
+    test_constexpr_member_operator_call,
+    test_constexpr_variadic_func,
     test_constexpr_func_unknown_branch,
 
     // should fail
+    test_should_fail_1,
     test_should_fail_max_block_states,
+
+    // weird stuff
+    // test_Lor_in_switch,
     // clang-format on
 };
 
@@ -2049,23 +2074,12 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Run test_cases with exec(), then test_cases and wlf_test_cases with exec_WLF()
     int n_failed = 0;
-    size_t n_runs = 0;
-    for (bool use_wlf : {false, true}) {
-        g_use_wlf_evaluator = use_wlf;
-        llvm::outs() << "========== Running test cases with " << (use_wlf ? "exec_WLF()" : "exec()")
-                     << " ==========\n";
-        std::vector<test_func> cases = test_cases;
-        if (use_wlf)
-            cases.insert(cases.end(), wlf_test_cases.begin(), wlf_test_cases.end());
-        for (auto test_case : cases) {
-            if (!test_case())
-                n_failed++;
-            n_runs++;
-        }
+    const size_t n_runs = test_cases.size();
+    for (auto test_case : test_cases) {
+        if (!test_case())
+            n_failed++;
     }
-    g_use_wlf_evaluator = false;
 
     if (n_failed != 0) {
         llvm::outs() << "Test statistics: " << n_failed << " / " << n_runs;

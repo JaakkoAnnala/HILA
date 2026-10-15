@@ -72,8 +72,8 @@ void report_diag(const ASTContext &ctx, DiagnosticsEngine::Level lev, const Sour
 bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx);
 bool eval_stmt(const Stmt *S, Eval_state &state, ASTContext &ASTctx);
 bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext &ASTctx);
-static bool eval_constexpr_function_WLF(const FunctionDecl *func, Eval_state &state,
-                                        ASTContext &ASTctx);
+static bool eval_constexpr_function(const FunctionDecl *func, Eval_state &state,
+                                    ASTContext &ASTctx);
 
 // Helper that adds the result of Expr E to the state.possible_vals_for_expr
 // if we are tracking the Expr E
@@ -576,12 +576,13 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         // the call needs a separate Eval_state
         Eval_state call_state;
 
-        // eval the argument values to the function call 
+        // eval the argument values to the function call
         // CE->arguments() map to func->parameters() one to one
         // NOTE edge cases:
         //  - call to a member operator, e.g. `obj(a)` or `obj + a` (CXXOperatorCallExpr), has
         //    the object as its first argument. A member function call `obj.f(a)`
-        //    (CXXMemberCallExpr) does not, and the parameters never include the implicit 'this' pointer.
+        //    (CXXMemberCallExpr) does not, and the parameters never include the implicit 'this'
+        //    pointer.
         //    TODO: C++23 explicit object parameters `this Self &self` are not handled
         //  - C-style variadic function has more arguments than parameters.
         // Arguments without a parameter are only evaluated for their side effects.
@@ -622,23 +623,11 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             }
             call_state.call_depth = state.call_depth + 1;
 
-            if (state.use_worklist) {
-                // Use the same worklist traversal as exec_WLF() for the callee.
-                call_state.use_worklist = true;
-                call_state.max_block_states = state.max_block_states;
-                call_state.func_cache = state.func_cache;
-                if (!eval_constexpr_function_WLF(func, call_state, ASTctx))
-                    return false;
-            } else {
-                // The legacy evaluator retains its recursive CFG traversal.
-                CFG::BuildOptions CFG_BO;
-                auto CFG = CFG::buildCFG(func, func_body, &ASTctx, CFG_BO);
-                auto entry_block = CFG->getEntry();
-                auto exit_block = CFG->getExit();
-                call_state.exit_block = &exit_block;
-                if (!eval_CFG_block(entry_block, call_state, ASTctx))
-                    return false;
-            }
+            // The callee is evaluated with the same worklist traversal as exec()
+            call_state.max_block_states = state.max_block_states;
+            call_state.func_cache = state.func_cache;
+            if (!eval_constexpr_function(func, call_state, ASTctx))
+                return false;
 
             // The callee can execute successfully while still having an
             // unknown return value (when argument is unknown)
@@ -796,8 +785,10 @@ bool eval_stmt(const Stmt *S, Eval_state &state, ASTContext &ASTctx) {
     return false;
 }
 
+// old stuff
 // We depend on the successor ordering defined by CFGBlock, see comment above class CFGBlock in
 // CFG.h in llvm sources
+#define MAX_BLOCK_VISITS 100 // for the old eval_CFG_block() stuff
 bool eval_CFG_block(const CFGBlock &block, Eval_state &state, ASTContext &ASTctx) {
     // reset block specific state
     state.block_expr_state.clear();
@@ -989,7 +980,7 @@ bool Idx_expr_evaluator::init(const FunctionDecl *func, Stmt *statement_in_the_f
     ASTctx = ctx;
     main_entry_block = &cfg->getEntry();
     main_exit_block = &cfg->getExit();
-    main_state.exit_block = main_exit_block;
+    // main_state.exit_block = main_exit_block; // only used by the old eval_CFG_block()
 
     diags.enable_colors(true);
     reported_diag.clear();
@@ -999,11 +990,6 @@ bool Idx_expr_evaluator::init(const FunctionDecl *func, Stmt *statement_in_the_f
 
 void Idx_expr_evaluator::add_expr_to_tracking_list(const Expr *E) {
     main_state.possible_vals_for_expr[E] = {}; // init as empty set
-}
-
-bool Idx_expr_evaluator::exec() {
-    assert(main_entry_block != nullptr);
-    return eval_CFG_block(*main_entry_block, main_state, *ASTctx);
 }
 
 std::pair<const Value_set *, bool> Idx_expr_evaluator::get_vals_for_expr(Expr *E) const {
@@ -1457,10 +1443,10 @@ static bool eval_CFG_worklist(const CFG &cfg, Eval_state &state, ASTContext &AST
     return true;
 }
 
-// Evaluate a constexpr function called during exec_WLF() with the same worklist traversal.
+// Evaluate a constexpr function called during exec() 
 // state.vars holds the argument values, the result is in state.return_val.
-static bool eval_constexpr_function_WLF(const FunctionDecl *func, Eval_state &state,
-                                        ASTContext &ASTctx) {
+static bool eval_constexpr_function(const FunctionDecl *func, Eval_state &state,
+                                    ASTContext &ASTctx) {
     Function_eval_cache *cache = state.func_cache;
 
     // The callee does not track any expressions and its variables are not reported, so the
@@ -1498,7 +1484,7 @@ static bool eval_constexpr_function_WLF(const FunctionDecl *func, Eval_state &st
     return true;
 }
 
-bool Idx_expr_evaluator::exec_WLF() {
+bool Idx_expr_evaluator::exec() {
     assert(cfg != nullptr);
     assert(ASTctx != nullptr);
 
@@ -1508,7 +1494,6 @@ bool Idx_expr_evaluator::exec_WLF() {
     for (auto &[expr, values] : main_state.possible_vals_for_expr)
         values.clear();
 
-    main_state.use_worklist = true;
     main_state.func_cache = &func_cache;
     main_state.eval_succeeded = eval_CFG_worklist(*cfg, main_state, *ASTctx);
     return main_state.eval_succeeded;

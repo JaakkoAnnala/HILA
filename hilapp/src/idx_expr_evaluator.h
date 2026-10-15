@@ -18,17 +18,6 @@
 
 // TODO: check llvm version requirement...
 
-// TODO: At the moment we give up every time that we encounter a control flow that we cannot
-// determine which branch to take. However, if we only care about for example ´x´ in:
-//  " // y = some unknown runtime value
-//  " int x,i;
-//  " for(i=0;i<10;++i){
-//  "     x++;
-//  "     if(y > 0) do_something();
-//  " }
-// if we figure out that `do_something()` does not affect the value of `x` we could still evaluate
-// the above... probably needs a quite a bit of figuring out...
-
 
 #include <map>
 #include <memory>
@@ -41,11 +30,8 @@
 using namespace clang;
 
 
-#define MAX_BLOCK_VISITS 100 // TODO: make this cofigurable
-// Default for Eval_state::max_block_states used by exec_WLF()
-#define DEFAULT_MAX_BLOCK_STATES 10000
-// Maximum depth of nested constexpr function calls we evaluate
-#define MAX_CALL_DEPTH 64
+#define DEFAULT_MAX_BLOCK_STATES 10000 // Default for Eval_state::max_block_states used by exec()
+#define MAX_CALL_DEPTH 64 // Maximum depth of nested constexpr function calls we evaluate
 
 using Value_set = std::set<std::optional<int64_t>>;
 
@@ -53,7 +39,7 @@ struct Eval_result {
     std::optional<int64_t> val = std::nullopt;
 };
 
-// exec_WLF(): results reused between calls to the same constexpr function. Owned by
+// exec(): results reused between calls to the same constexpr function. Owned by
 // Idx_expr_evaluator, as the cached pointers are only valid for one ASTContext.
 struct Function_eval_cache {
     std::unordered_map<const FunctionDecl *, std::unique_ptr<CFG>> cfgs;
@@ -65,20 +51,16 @@ struct Function_eval_cache {
 
 struct Eval_state {
 
-    // Selects the worklist CFG traversal of exec_WLF() also for called constexpr function bodies.
-    // The legacy evaluator leaves this false and continues to use eval_CFG_block().
-    bool use_worklist = false;
-
-    // exec_WLF(): the maximum number of distinct states (variable values) allowed to enter a single
-    // CFG block. More means e.g. a loop with an unknown or a too large trip count, in which case the
-    // evaluation is stopped and does not succeed.
+    // The maximum number of distinct states (variable values) allowed to enter a single
+    // CFG block. More means e.g. a loop with an unknown or a too large trip count, in which case
+    // the evaluation is stopped and does not succeed.
     uint64_t max_block_states = DEFAULT_MAX_BLOCK_STATES;
 
-    // exec_WLF(): shared with the Eval_states of called constexpr functions, may be nullptr.
+    // Shared with the Eval_states of called constexpr functions, may be nullptr.
     Function_eval_cache *func_cache = nullptr;
 
     // Depth of nested constexpr function calls
-    unsigned call_depth = 0;
+    uint64_t call_depth = 0;
 
     ////////////////////////////////////////////
     // The state during evaluation:
@@ -97,6 +79,7 @@ struct Eval_state {
 
     std::unordered_map<const Expr *, std::optional<int64_t>> block_expr_state;
 
+    // Only used by the old eval_CFG_block(), which is not used anymore:
     // Track how many times we have visited each block in the control flow graph `CFG`.
     // This needs to be done so we can limit the amount of times we allow the evaluation to evaluate
     // e.g. loops.
@@ -123,14 +106,11 @@ struct Idx_expr_evaluator {
 
     void add_expr_to_tracking_list(const Expr *E);
 
-    // return false if we encountered something we dont handle.
+    // Evaluate all execution paths through the statement given to init() with a worklist: a
+    // condition with an unknown value follows both branches. Sets main_state.eval_succeeded.
+    // Returns false if we encountered something we dont handle or more than
+    // main_state.max_block_states distinct states reach a CFG block, the results are not reliable
     bool exec();
-
-    // Like exec(), but explores all execution paths with a worklist: a condition with an unknown
-    // value follows both branches instead of failing. Sets main_state.eval_succeeded. Returns false
-    // if we encountered something we dont handle or more than main_state.max_block_states distinct
-    // states reach a CFG block; the results are not reliable then.
-    bool exec_WLF();
 
     /**
      * @param E the Expr* we want to get the possible values for.
@@ -151,7 +131,7 @@ struct Idx_expr_evaluator {
 
     Eval_state main_state{};
 
-//  private:
+    //  private:
     std::unique_ptr<CFG> cfg;
     ASTContext *ASTctx;
     Function_eval_cache func_cache;
