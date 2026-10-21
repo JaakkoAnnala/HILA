@@ -226,14 +226,13 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
         for (field_info &l : field_info_list) {
             for (const std::string &name : l.outside_loop_names()) {
                 // If neighbour references exist, communicate them
-                if (!l.is_loop_local_dir) {
-                    // "normal" dir references only here
-                    for (dir_ptr &d : l.dir_list)
-                        if (d.count > 0) {
+                if (const auto dirs = gather_directions(l, name)) {
+                    // the directions to gather, see gather_directions()
+                    for (const std::string &dir : *dirs) {
 
-                            code << "_dir_mask_ |= " << name << ".pack_buffers(" << d.direxpr_s
-                                 << ", " << loop_info.parity_str << ", halo_stream);\n";
-                        }
+                        code << "_dir_mask_ |= " << name << ".pack_buffers(" << dir << ", "
+                             << loop_info.parity_str << ", halo_stream);\n";
+                    }
                 } else {
                     code << "for (Direction HILA_dir_ = (Direction)0; HILA_dir_ < NDIRS; "
                             "++HILA_dir_) {\n"
@@ -278,14 +277,13 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             for (field_info &l : field_info_list) {
                 for (const std::string &name : l.outside_loop_names()) {
                     // If neighbour references exist, communicate them
-                    if (!l.is_loop_local_dir) {
-                        // "normal" dir references only here
-                        for (dir_ptr &d : l.dir_list)
-                            if (d.count > 0) {
+                    if (const auto dirs = gather_directions(l, name)) {
+                        // the directions to gather, see gather_directions()
+                        for (const std::string &dir : *dirs) {
 
-                                code << "_dir_mask_ |= " << name << ".start_communication("
-                                     << d.direxpr_s << ", " << loop_info.parity_str << ");\n";
-                            }
+                            code << "_dir_mask_ |= " << name << ".start_communication(" << dir
+                                 << ", " << loop_info.parity_str << ");\n";
+                        }
                     } else {
                         code << "for (Direction HILA_dir_ = (Direction)0; HILA_dir_ < NDIRS; "
                                 "++HILA_dir_) {\n"
@@ -299,12 +297,11 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             for (field_info &l : field_info_list) {
                 for (const std::string &name : l.outside_loop_names()) {
                     // If neighbour references exist, communicate them
-                    if (!l.is_loop_local_dir) {
-                        for (dir_ptr &d : l.dir_list)
-                            if (d.count > 0) {
-                                code << name << ".wait_gather(" << d.direxpr_s << ", "
-                                     << loop_info.parity_str << ");\n";
-                            }
+                    if (const auto dirs = gather_directions(l, name)) {
+                        for (const std::string &dir : *dirs) {
+                            code << name << ".wait_gather(" << dir << ", " << loop_info.parity_str
+                                 << ");\n";
+                        }
                     } else {
                         code << "for (Direction HILA_dir_ = (Direction)0; HILA_dir_ < NDIRS; "
                                 "++HILA_dir_) {\n"
@@ -317,14 +314,12 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             bool code_generated = false;
             for (field_info &l : field_info_list) {
                 for (const std::string &name : l.outside_loop_names()) {
-                    if (!l.is_loop_local_dir) {
-                        for (dir_ptr &d : l.dir_list)
-                            if (d.count > 0) {
+                    if (const auto dirs = gather_directions(l, name)) {
+                        for (const std::string &dir : *dirs) {
 
-                                code << "_dir_mask_ |= " << name << ".pack_buffers("
-                                     << d.direxpr_s << ", " << loop_info.parity_str
-                                     << ", halo_stream);\n";
-                            }
+                            code << "_dir_mask_ |= " << name << ".pack_buffers(" << dir << ", "
+                                 << loop_info.parity_str << ", halo_stream);\n";
+                        }
                     } else {
                         code << "for (Direction HILA_dir_ = (Direction)0; HILA_dir_ < NDIRS; "
                                 "++HILA_dir_) {\n"
@@ -335,19 +330,17 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             }
             for (field_info &l : field_info_list) {
                 for (const std::string &name : l.outside_loop_names()) {
-                    if (!l.is_loop_local_dir) {
-                        for (dir_ptr &d : l.dir_list)
-                            if (d.count > 0) {
-                                if (!code_generated) {
-                                    code_generated = true;
-                                    if (gpu_ccl)
-                                        code << "gcclGroupStart();\n";
-                                }
-
-                                code << "_dir_mask_ |= " << name << ".stream_gather("
-                                     << d.direxpr_s << ", " << loop_info.parity_str
-                                     << ", halo_stream);\n";
+                    if (const auto dirs = gather_directions(l, name)) {
+                        for (const std::string &dir : *dirs) {
+                            if (!code_generated) {
+                                code_generated = true;
+                                if (gpu_ccl)
+                                    code << "gcclGroupStart();\n";
                             }
+
+                            code << "_dir_mask_ |= " << name << ".stream_gather(" << dir << ", "
+                                 << loop_info.parity_str << ", halo_stream);\n";
+                        }
                     } else {
                         if (!code_generated) {
                             code_generated = true;
@@ -371,13 +364,12 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             }
             for (field_info &l : field_info_list) {
                 for (const std::string &name : l.outside_loop_names()) {
-                    if (!l.is_loop_local_dir) {
-                        for (dir_ptr &d : l.dir_list)
-                            if (d.count > 0) {
+                    if (const auto dirs = gather_directions(l, name)) {
+                        for (const std::string &dir : *dirs) {
 
-                                code << name << ".unpack_buffers(" << d.direxpr_s << ", "
-                                     << loop_info.parity_str << ", halo_stream);\n";
-                            }
+                            code << name << ".unpack_buffers(" << dir << ", "
+                                 << loop_info.parity_str << ", halo_stream);\n";
+                        }
                     } else {
                         code << "for (Direction HILA_dir_ = (Direction)0; HILA_dir_ < NDIRS; "
                                 "++HILA_dir_) {\n"
@@ -780,7 +772,6 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             for (bracket_ref_t &br : ar.refs) {
                 loopBuf.replace(br.BASE, ar.new_name);
             }
-
         } else {
 
             // Finally, we have reductionvector here
@@ -932,7 +923,8 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
     // First, reset philox loop counter
 
     if (loop_info.contains_random) {
-        kernel << "// philox_setup_loopcount calls __syncthreads(); must be called by all threads\n";
+        kernel
+            << "// philox_setup_loopcount calls __syncthreads(); must be called by all threads\n";
         kernel << "hila::philox_setup_loopcount(HILA_philox_loop_counter);\n";
     }
 
@@ -981,8 +973,8 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
 
     // index of deep halo ref X + k*dir
     auto deep_index = [&](const dir_ptr &d) -> std::string {
-        return "hila_dev_neighbour_offset(HILA_site_, " + deep_dir_string(d, loopBuf, true) +
-               ", " + std::to_string(d.deep_k) + ")";
+        return "hila_dev_neighbour_offset(HILA_site_, " + deep_dir_string(d, loopBuf, true) + ", " +
+               std::to_string(d.deep_k) + ")";
     };
 
     // expression for the index of the neighbour of fieldname to direction dirname
@@ -1377,13 +1369,12 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             for (field_info &l : field_info_list) {
                 for (const std::string &name : l.outside_loop_names()) {
                     // If neighbour references exist, communicate them
-                    if (!l.is_loop_local_dir) {
-                        // "normal" dir references only here
-                        for (dir_ptr &d : l.dir_list)
-                            if (d.count > 0) {
-                                code << "_dir_mask_ |= " << name << ".start_communication("
-                                     << d.direxpr_s << ", " << loop_info.parity_str << ");\n";
-                            }
+                    if (const auto dirs = gather_directions(l, name)) {
+                        // the directions to gather, see gather_directions()
+                        for (const std::string &dir : *dirs) {
+                            code << "_dir_mask_ |= " << name << ".start_communication(" << dir
+                                 << ", " << loop_info.parity_str << ");\n";
+                        }
                     } else {
                         code << "for (Direction HILA_dir_ = (Direction)0; HILA_dir_ < NDIRS; "
                                 "++HILA_dir_) {\n"
@@ -1397,12 +1388,11 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             for (field_info &l : field_info_list) {
                 for (const std::string &name : l.outside_loop_names()) {
                     // If neighbour references exist, communicate them
-                    if (!l.is_loop_local_dir) {
-                        for (dir_ptr &d : l.dir_list)
-                            if (d.count > 0) {
-                                code << name << ".wait_gather(" << d.direxpr_s << ", "
-                                     << loop_info.parity_str << ");\n";
-                            }
+                    if (const auto dirs = gather_directions(l, name)) {
+                        for (const std::string &dir : *dirs) {
+                            code << name << ".wait_gather(" << dir << ", " << loop_info.parity_str
+                                 << ");\n";
+                        }
                     } else {
                         code << "for (Direction HILA_dir_ = (Direction)0; HILA_dir_ < NDIRS; "
                                 "++HILA_dir_) {\n"
@@ -1416,12 +1406,11 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             for (field_info &l : field_info_list) {
                 for (const std::string &name : l.outside_loop_names()) {
                     // If neighbour references exist, communicate them
-                    if (!l.is_loop_local_dir) {
-                        for (dir_ptr &d : l.dir_list)
-                            if (d.count > 0) {
-                                code << "    " << name << ".unpack_buffers(" << d.direxpr_s
-                                     << ", " << loop_info.parity_str << ", halo_stream);\n";
-                            }
+                    if (const auto dirs = gather_directions(l, name)) {
+                        for (const std::string &dir : *dirs) {
+                            code << "    " << name << ".unpack_buffers(" << dir << ", "
+                                 << loop_info.parity_str << ", halo_stream);\n";
+                        }
                     } else {
                         code << "    for (Direction HILA_dir_ = (Direction)0; HILA_dir_ < NDIRS; "
                                 "++HILA_dir_) {\n"
@@ -1455,19 +1444,17 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             bool code_generated = false;
             for (field_info &l : field_info_list) {
                 for (const std::string &name : l.outside_loop_names()) {
-                    if (!l.is_loop_local_dir) {
-                        for (dir_ptr &d : l.dir_list)
-                            if (d.count > 0) {
-                                if (!code_generated) {
-                                    code_generated = true;
-                                    if (gpu_ccl)
-                                        code << "gcclGroupStart();\n";
-                                }
-
-                                code << "_dir_mask_ |= " << name << ".stream_gather("
-                                     << d.direxpr_s << ", " << loop_info.parity_str
-                                     << ", halo_stream);\n";
+                    if (const auto dirs = gather_directions(l, name)) {
+                        for (const std::string &dir : *dirs) {
+                            if (!code_generated) {
+                                code_generated = true;
+                                if (gpu_ccl)
+                                    code << "gcclGroupStart();\n";
                             }
+
+                            code << "_dir_mask_ |= " << name << ".stream_gather(" << dir << ", "
+                                 << loop_info.parity_str << ", halo_stream);\n";
+                        }
                     } else {
                         if (!code_generated) {
                             code_generated = true;
@@ -1491,13 +1478,12 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             }
             for (field_info &l : field_info_list) {
                 for (const std::string &name : l.outside_loop_names()) {
-                    if (!l.is_loop_local_dir) {
-                        for (dir_ptr &d : l.dir_list)
-                            if (d.count > 0) {
+                    if (const auto dirs = gather_directions(l, name)) {
+                        for (const std::string &dir : *dirs) {
 
-                                code << name << ".unpack_buffers(" << d.direxpr_s << ", "
-                                     << loop_info.parity_str << ", halo_stream);\n";
-                            }
+                            code << name << ".unpack_buffers(" << dir << ", "
+                                 << loop_info.parity_str << ", halo_stream);\n";
+                        }
                     } else {
                         code << "for (Direction HILA_dir_ = (Direction)0; HILA_dir_ < NDIRS; "
                                 "++HILA_dir_) {\n"

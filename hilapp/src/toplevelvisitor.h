@@ -134,6 +134,9 @@ class TopLevelVisitor : public GeneralVisitor, public RecursiveASTVisitor<TopLev
     // void check_allowed_assignment(Stmt *s);
 
     bool analyse_loop_local_field_refs(Stmt *loop_body);
+    int number_of_directions();
+    std::optional<std::vector<std::string>> gather_directions(const field_info &l,
+                                                              const std::string &name);
     bool check_field_ref_list();
 
     void check_var_info_list();

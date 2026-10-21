@@ -13,6 +13,8 @@
 /// Implementation of most toplevelvisitor methods
 /////////
 
+#define NEG_DIR_CONST_OFFSET 50
+
 // define the ptr to the visitor here
 TopLevelVisitor *g_TopLevelVisitor;
 
@@ -289,7 +291,7 @@ bool TopLevelVisitor::handle_field_X_expr(Expr *e, bool &is_assign, bool is_also
                 if (strcmp(ops, "+") == 0)
                     offset = 0;
                 else if (strcmp(ops, "-") == 0)
-                    offset = 50;
+                    offset = NEG_DIR_CONST_OFFSET;
                 else {
                     llvm::errs() << "This cannot happen, direction op " << ops << '\n';
                     exit(1);
@@ -297,7 +299,7 @@ bool TopLevelVisitor::handle_field_X_expr(Expr *e, bool &is_assign, bool is_also
 
                 lfe.is_constant_direction = true;
                 // constant_value is used to uniquely label directions.
-                // Give negative dirs an offset of 50.
+                // Give negative dirs an offset of NEG_DIR_CONST_OFFSET=50.
                 lfe.constant_value = result.getExtValue() + offset;
 
 
@@ -306,6 +308,11 @@ bool TopLevelVisitor::handle_field_X_expr(Expr *e, bool &is_assign, bool is_also
             } else {
                 lfe.is_constant_direction = false;
                 // llvm::errs() << "GOT DIR NOT-CONST " << lfe.direxpr_s << '\n';
+
+                // the direction expression and the sign, for finding the values of a loop
+                // local direction in analyse_loop_local_field_refs()
+                lfe.dirExpr = dirE;
+                lfe.dir_negate = (strcmp(getOperatorSpelling(Op->getOperator()), "-") == 0);
 
                 // If the Direction is a variable, add it to the list
                 // DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(lfe.dirExpr);
@@ -1644,18 +1651,28 @@ bool TopLevelVisitor::TraverseDecl(Decl *D) {
 //////////////////////////////////////////////////////////////////////////////
 /// Process the Field<> -references appearing in this loop, and
 /// construct the field_info_list
-//////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////
 
 
-/// Find the values the index of a field reference like U[mu][X], where mu is
-/// defined inside the site loop, can have. All of them are found with one
-/// Idx_expr_evaluator run over the loop body. Returns false if we are unable to analyze the
-/// expression
+/// Find with one Idx_expr_evaluator run over the loop body
+///  - the values the index of a field reference like U[mu][X], where mu is
+///    defined inside the site loop, can have, and
+///  - the directions of nearest neighbour references like f[X + mu] or
+///    U[mu][X - mu] with a loop local direction, as (index value, direction)
+///    pairs, so that only these directions need to be gathered.
+/// Returns false if the index values can not be determined. If the directions
+/// can not be determined, all directions are gathered.
 bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
+
+    // helper: nearest neighbour reference with a loop local direction
+    auto has_loop_local_nb_dir = [](const field_ref &r) {
+        return r.is_direction && r.is_loop_local_dir && !r.is_offset && r.deep_k == 0 &&
+               r.dirExpr != nullptr;
+    };
 
     bool any = false;
     for (field_ref &r : field_ref_list)
-        if (r.is_loop_local_ref)
+        if (r.is_loop_local_ref || has_loop_local_nb_dir(r))
             any = true;
     if (!any)
         return true;
@@ -1663,9 +1680,19 @@ bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
     Idx_expr_evaluator evaluator{};
     bool ok = evaluator.init(global.currentFunctionDecl, loop_body, getASTContext());
     if (ok) {
-        for (field_ref &r : field_ref_list)
+        for (field_ref &r : field_ref_list) {
             if (r.is_loop_local_ref)
                 evaluator.add_expr_to_tracking_list(r.ref_index);
+            if (has_loop_local_nb_dir(r)) {
+                // the direction together with the index of a field like U[mu]: only the
+                // combinations that occur, e.g. U[mu][X - mu] uses e_x with U[e_x] etc.
+                std::vector<const Expr *> child_exprs;
+                if (r.is_loop_local_ref)
+                    child_exprs.push_back(r.ref_index);
+                child_exprs.push_back(r.dirExpr);
+                evaluator.add_tuple_to_tracking_list(r.fullExpr, child_exprs);
+            }
+        }
         ok = evaluator.exec();
     }
 
@@ -1688,6 +1715,34 @@ bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
             r.ref_idx_set.insert(v.value());
     }
 
+    // The directions: X - dir is the opposite direction. A reference that is
+    // never evaluated has no directions, it is not executed.
+    const int ndirs = number_of_directions();
+    for (field_ref &r : field_ref_list) {
+        if (!has_loop_local_nb_dir(r))
+            continue;
+        r.loop_local_dirs.clear();
+        r.loop_local_dirs_known = false;
+
+        const auto [tuples, reliable] = evaluator.get_tuples_for_expr(r.fullExpr);
+        if (!ok || tuples == nullptr || !reliable || ndirs <= 0)
+            continue;
+
+        bool valid = true;
+        for (const Value_tuple &t : *tuples) {
+            const int64_t idx = r.is_loop_local_ref ? t.front().value() : 0;
+            int64_t dir = t.back().value();
+            if (dir < 0 || dir >= ndirs) {
+                valid = false;
+                break;
+            }
+            if (r.dir_negate)
+                dir = ndirs - 1 - dir;
+            r.loop_local_dirs.insert({idx, dir});
+        }
+        r.loop_local_dirs_known = valid;
+    }
+
     if (!all_found) {
         // TODO: print these only with a command line option?
         llvm::errs() << "---------- Idx_expr_evaluator internal diagnostics -----------\n";
@@ -1695,6 +1750,75 @@ bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
         llvm::errs() << "--------------------------------------------------------------\n";
     }
     return all_found;
+}
+
+
+/// The number of directions NDIRS = 2 * NDIM, TODO: is this the best way to do this...
+int TopLevelVisitor::number_of_directions() {
+    static int ndirs = -1;
+    if (ndirs < 0) {
+        ndirs = 0;
+        std::string arg;
+        if (is_macro_defined("NDIM", &arg)) {
+            const int ndim = std::atoi(arg.c_str());
+            if (ndim >= 1)
+                ndirs = 2 * ndim;
+        } else {
+            assert(false &&
+                   "The macro NDIM is not defined. Dont know what to do regarding directions..");
+        }
+    }
+    return ndirs;
+}
+
+
+/// The directions to gather before the loop for the Field variable `name` of
+/// field l (one of l.outside_loop_names()), as Direction expressions.
+/// std::nullopt: gather all directions, because a direction depends on a loop
+/// local variable whose values are not known.
+std::optional<std::vector<std::string>>
+TopLevelVisitor::gather_directions(const field_info &l, const std::string &name) {
+
+    if (l.is_loop_local_dir && !l.loop_local_dirs_known)
+        return std::nullopt;
+
+    // the index value of the Field variable, 0 if the field does not have a loop local index
+    int64_t idx = 0;
+    if (l.is_loop_local_ref) {
+        auto value = l.ref_idx_set.begin();
+        for (const std::string &n : l.outside_loop_names()) {
+            if (n == name) {
+                idx = *value;
+                break;
+            }
+            ++value;
+        }
+    }
+
+    const int ndirs = number_of_directions();
+    std::vector<std::string> dirs;
+    std::set<int64_t> numbers; // to gather each direction once
+    for (const dir_ptr &d : l.dir_list) {
+        if (d.count == 0 || d.is_loop_local_dir)
+            continue;
+        if (d.is_constant_direction && ndirs > 0) {
+            // constant_value is the direction, + NEG_DIR_CONST_OFFSET for X - dir
+            const int64_t n = (d.constant_value >= NEG_DIR_CONST_OFFSET)
+                                  ? ndirs - 1 - (d.constant_value - NEG_DIR_CONST_OFFSET)
+                                  : d.constant_value;
+            if (!numbers.insert(n).second)
+                continue;
+        }
+        dirs.push_back(d.direxpr_s);
+    }
+    if (l.is_loop_local_dir) {
+        const auto it = l.loop_local_gather_dirs.find(idx);
+        if (it != l.loop_local_gather_dirs.end())
+            for (int64_t n : it->second)
+                if (numbers.insert(n).second)
+                    dirs.push_back("static_cast<Direction>(" + std::to_string(n) + ")");
+    }
+    return dirs;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1793,8 +1917,18 @@ bool TopLevelVisitor::check_field_ref_list() {
 
         if (p.is_direction) {
 
-            if (p.is_loop_local_dir)
+            if (p.is_loop_local_dir) {
                 fip->is_loop_local_dir = true;
+
+                // the directions to gather for the loop local direction, see
+                // analyse_loop_local_field_refs()
+                if (!p.is_offset && p.deep_k == 0) {
+                    if (!p.loop_local_dirs_known)
+                        fip->loop_local_dirs_known = false;
+                    for (const auto &[idx, dir] : p.loop_local_dirs)
+                        fip->loop_local_gather_dirs[idx].insert(dir);
+                }
+            }
 
             // does this dir with this field name exist before?
             // Use is_duplicate_expr() to resolve the ptr, it has (some) intelligence to

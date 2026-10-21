@@ -5,6 +5,8 @@
 #include <vector>
 #include <list>
 #include <set>
+#include <map>
+#include <optional>
 #include <cstdlib>
 #include <iostream>
 
@@ -154,11 +156,21 @@ struct field_ref {
 
     // field accessed with index that depends on a loop local variable, eg U[mu] inside
     // foralldir(mu). Only the form base[index] is supported, ref_base is "U" and ref_index "mu".
-    // ref_idx_set holds the values the index can have, obtained from analyse_loop_local_field_refs()
+    // ref_idx_set holds the values the index can have, obtained from
+    // analyse_loop_local_field_refs()
     bool is_loop_local_ref;
     Expr *ref_base;
     Expr *ref_index;
     std::set<int64_t> ref_idx_set;
+
+    // A nearest neighbour reference X + dir or X - dir with a non-constant direction. For a loop
+    // local direction, loop_local_dirs holds the (index value, direction) pairs the reference uses,
+    // obtained in analyse_loop_local_field_refs(). The index value is that of ref_index for a field
+    // with a loop local index, otherwise 0. If idx/dir are unknown all directions are gathered
+    Expr *dirExpr;
+    bool dir_negate;
+    std::set<std::pair<int64_t, int64_t>> loop_local_dirs;
+    bool loop_local_dirs_known;
 
     field_ref() {
         fullExpr = nameExpr = parityExpr = nullptr;
@@ -172,6 +184,9 @@ struct field_ref {
         deep_negate = false;
         is_loop_local_ref = false;
         ref_base = ref_index = nullptr;
+        dirExpr = nullptr;
+        dir_negate = false;
+        loop_local_dirs_known = false;
     }
 
     ~field_ref() {
@@ -285,17 +300,25 @@ struct field_info {
     int first_assign_seq;   // the sequence of the first assignment
 
     // A field accessed with a loop local index, e.g. U[mu] inside foralldir(mu)
-    // fields in arrays (like GaugeField) can not be referred to outside the loop with old_name. Instead there is one
-    // Field variable for each possible index value, generate names with outside_loop_names()
+    // fields in arrays (like GaugeField) can not be referred to outside the loop with old_name.
+    // Instead there is one Field variable for each possible index value, generate names with
+    // outside_loop_names()
     bool is_loop_local_ref;
-    std::string ref_base_str;      // ge "U" in U[mu]
+    std::string ref_base_str;      // eg. "U" in U[mu]
     std::string ref_index_type;    // type of the index, eg "Direction"
     std::set<int64_t> ref_idx_set; // all possible values the index takes
+
+    // The directions to gather for the loop local directions of the references, for each index
+    // value (0 for a field without a loop local index). If loop_local_dirs_known is false, all
+    // directions are gathered. See TopLevelVisitor::gather_directions().
+    bool loop_local_dirs_known;
+    std::map<int64_t, std::set<int64_t>> loop_local_gather_dirs;
 
     field_info() {
         type_template = old_name = new_name = loop_ref_name = "";
         is_written = is_read_nb = is_read_atX = is_read_offset = is_loop_local_dir = false;
         is_loop_local_ref = false;
+        loop_local_dirs_known = true;
         first_assign_seq = 0;
         dir_list = {};
         ref_list = {};
