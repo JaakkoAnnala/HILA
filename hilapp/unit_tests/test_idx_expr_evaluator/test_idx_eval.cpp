@@ -1273,6 +1273,269 @@ bool test_ref_variable_unknown_target() {
     TEST_CASE_END;
 }
 
+bool test_other_expression_kinds() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Expressions the evaluator does not model (floating point literals, initializer lists) give
+    // unknown values but do not stop the evaluation. Constants like sizeof are evaluated.
+    TEST_EVAL_STRING_CSTMT(R"(
+    int x = 0;
+    double d = 0.5;
+    float f = 1.5f;
+    int arr[3] = {1, 2, 3};
+    x = sizeof(int);
+    x = 'a';
+    bool b = true;
+    x += b;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-variable"
+    TrackedVar<int> x = 0;
+    double d = 0.5;
+    float f = 1.5f;
+    int arr[3] = {1, 2, 3};
+    x = sizeof(int);
+    x = 'a';
+    bool b = true;
+    x += b;
+#pragma clang diagnostic pop
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+
+    TEST_CASE_END;
+}
+
+bool test_bool_and_char_literals() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // bool literals in arithmetic, conversions and conditions, and character literals of the
+    // different kinds, also with escapes and arithmetic that wraps in char.
+    TEST_EVAL_STRING_CSTMT(R"(
+    int x = 0;
+    x = true + true;
+    x = false;
+    x = !false;
+    bool b = 5;
+    x = b + 10;
+    int n = 0;
+    bool flag = true;
+    while (flag) {
+        n++;
+        if (n == 3) flag = false;
+    }
+    int c = 0;
+    c = 'z' - 'a';
+    c = '\n';
+    c = '\0';
+    char ch = 'a';
+    ch += 2;
+    c = ch - 'a';
+    char wrap = 127;
+    wrap += 1;
+    char sc = '\xff';
+    unsigned char uc = '\xff';
+    c = L'A';
+    c = u'ä';
+    c = U'\U0001F600';
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconstant-conversion"
+    TrackedVar<int> x = 0;
+    x = true + true;
+    x = false;
+    x = !false;
+    TrackedVar<bool> b = 5;
+    x = b + 10;
+    TrackedVar<int> n = 0;
+    TrackedVar<bool> flag = true;
+    while (flag) {
+        n++;
+        if (n == 3) flag = false;
+    }
+    TrackedVar<int> c = 0;
+    c = 'z' - 'a';
+    c = '\n';
+    c = '\0';
+    TrackedVar<char> ch = 'a';
+    ch += 2;
+    c = ch - 'a';
+    TrackedVar<char> wrap = 127;
+    wrap += 1;
+    TrackedVar<char> sc = '\xff';
+    TrackedVar<unsigned char> uc = '\xff';
+    c = L'A';
+    c = u'ä';
+    c = U'\U0001F600';
+#pragma clang diagnostic pop
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+    COMPARE_AND_SET_TEST_PASS(b);
+    COMPARE_AND_SET_TEST_PASS(n);
+    COMPARE_AND_SET_TEST_PASS(flag);
+    COMPARE_AND_SET_TEST_PASS(c);
+    COMPARE_AND_SET_TEST_PASS(ch);
+    COMPARE_AND_SET_TEST_PASS(wrap);
+    COMPARE_AND_SET_TEST_PASS(sc);
+    COMPARE_AND_SET_TEST_PASS(uc);
+
+    TEST_CASE_END;
+}
+
+bool test_floating_point_is_unknown() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // A floating point value can not be tracked as an integer: with integer arithmetic k would be
+    // (3 / 2) * 2 = 2, but it is (1.5) * 2 = 3.
+    TEST_EVAL_STRING_CSTMT(R"(
+    int i = 3;
+    double d = i;
+    int k = 0;
+    k = (d / 2) * 2;
+    )")
+    /////////////////////////////////////////////
+    // The evaluator does not track floating point values, so k can not be compared.
+    /////////////////////////////////////////////
+    if (!test_analyzer.exec_ret)
+        test_pass = false;
+    EXPECT_UNKNOWN_AND_SET_TEST_PASS(k);
+
+    TEST_CASE_END;
+}
+
+bool test_unsigned_and_narrowing() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Values follow the types: unsigned arithmetic wraps, narrowing conversions truncate, also
+    // with explicit casts.
+    TEST_EVAL_STRING_CSTMT(R"(
+    unsigned u = 0;
+    u--;
+    int y = 0;
+    if (u > 0) y = 1;
+    else y = 2;
+    int x = 300;
+    unsigned char c = 0;
+    c = x;
+    int n = 0;
+    n = static_cast<unsigned char>(x);
+    n = (short)(x * 1000);
+    n = int(u / 2);
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+    TrackedVar<unsigned> u = 0;
+    u--;
+    TrackedVar<int> y = 0;
+    if (u > 0) y = 1;
+    else y = 2;
+    int x = 300;
+    TrackedVar<unsigned char> c = 0;
+    c = x;
+    TrackedVar<int> n = 0;
+    n = static_cast<unsigned char>(x);
+    n = (short)(x * 1000);
+    n = int(u / 2);
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(u);
+    COMPARE_AND_SET_TEST_PASS(y);
+    COMPARE_AND_SET_TEST_PASS(c);
+    COMPARE_AND_SET_TEST_PASS(n);
+
+    TEST_CASE_END;
+}
+
+bool test_constants_declared_outside() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Constants declared outside the evaluated code have their values
+    TEST_EVAL_STRING_TOPLVL(R"(
+constexpr int N = 3;
+const int M = 2;
+void test(){
+    int x = 0;
+    for(int i = 0; i < N; ++i){
+        x += M;
+    }
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+constexpr int N = 3;
+const int M = 2;
+//void test(){
+    TrackedVar<int> x = 0;
+    for(int i = 0; i < N; ++i){
+        x += M;
+    }
+//}
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+
+    TEST_CASE_END;
+}
+
+bool test_enum_direction_loop() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // A loop over an unsigned enum like HILA's foralldir(d)
+    TEST_EVAL_STRING_TOPLVL(R"(
+enum Dir : unsigned { e_x = 0, e_y, e_z, e_z_down, e_y_down, e_x_down, NDIRS };
+constexpr Dir next_dir(Dir d){
+    return static_cast<Dir>(static_cast<unsigned>(d) + 1);
+}
+constexpr Dir opp_dir(Dir d){
+    return static_cast<Dir>(NDIRS - 1 - static_cast<int>(d));
+}
+void test(){
+    int sum = 0;
+    int opp = 0;
+    for(Dir d = e_x; d < 3; d = next_dir(d)){
+        sum += d;
+        opp = opp_dir(d);
+    }
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+// local enum and lambdas so we can keep them contained in the test function ...
+enum Dir : unsigned { e_x = 0, e_y, e_z, e_z_down, e_y_down, e_x_down, NDIRS };
+// constexpr Dir next_dir(Dir d){
+constexpr auto next_dir = [](Dir d){
+    return static_cast<Dir>(static_cast<unsigned>(d) + 1);
+};
+// constexpr Dir opp_dir(Dir d){
+constexpr auto opp_dir = [](Dir d){
+    return static_cast<Dir>(NDIRS - 1 - static_cast<int>(d));
+};
+//void test(){
+    TrackedVar<int> sum = 0;
+    TrackedVar<int> opp = 0;
+    for(Dir d = e_x; d < 3; d = next_dir(d)){
+        sum += d;
+        opp = opp_dir(d);
+    }
+//}
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(sum);
+    COMPARE_AND_SET_TEST_PASS(opp);
+
+    TEST_CASE_END;
+}
+
 bool test_lots_of_control_flow_things_1() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -1913,6 +2176,27 @@ int y = 0;
 ////////////////////////////////////////////////////////
 // test things that should fail exec: limits
 
+bool test_should_fail_address_of_variable() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // `x` could be changed through the pointer, which is not followed
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-variable"
+    TEST_EVAL_STRING_CSTMT(R"(
+    int x = 0;
+    int *p = &x;
+    *p = 5;
+    int y = 0;
+    y = x;
+    )")
+#pragma clang diagnostic pop
+    /////////////////////////////////////////////
+    if (test_analyzer.exec_ret || test_state.eval_succeeded)
+        test_pass = false;
+
+    TEST_CASE_END;
+}
+
 bool test_should_fail_max_block_states() {
     TEST_CASE_BEGIN;
 
@@ -2024,6 +2308,14 @@ static std::vector<test_func> test_cases = {
     // implicit conversions
     test_int_to_bool_conversion,
 
+    // types, constants and other kinds of expressions
+    test_other_expression_kinds,
+    test_bool_and_char_literals,
+    test_floating_point_is_unknown,
+    test_unsigned_and_narrowing,
+    test_constants_declared_outside,
+    test_enum_direction_loop,
+
     //
     test_lots_of_control_flow_things_1,
     test_lots_of_control_flow_things_2,
@@ -2050,6 +2342,7 @@ static std::vector<test_func> test_cases = {
     // should fail
     test_should_fail_1,
     test_should_fail_max_block_states,
+    test_should_fail_address_of_variable,
 
     // weird stuff
     // test_Lor_in_switch,
