@@ -111,6 +111,9 @@ class field_storage {
     }
 };
 
+
+// these are here for now, used to map the input args of kernelized code to the indexes in user
+// written code.
 namespace hila {
 
 /**
@@ -134,7 +137,43 @@ DEVICE inline const S &select_storage(const int64_t idx, const S &s0, const Ss &
         return (idx == V0) ? s0 : select_storage<Vs...>(idx, ss...);
     }
 }
+
+/**
+ * @brief The position of the value `v` in the list of values V0, Vs... Used by hilapp
+ * (FETCH_FIELD_REFS_LOOP_LOCAL) to find the element of a field with a loop local index read into an
+ * array at the start of the loop, e.g. value_position<0, 1, 2, 3>(mu) for U[mu][X].
+ *
+ * @details The last position is returned without a check, the analysis of hilapp guarantees that
+ * v is one of the values. A constant if the loop over the index is unrolled.
+ */
+template <int64_t V0, int64_t... Vs>
+DEVICE constexpr inline int value_position(const int64_t v) {
+    if constexpr (sizeof...(Vs) == 0) {
+        (void)v;
+        return 0;
+    } else {
+        return (v == V0) ? 0 : 1 + value_position<Vs...>(v);
+    }
 }
+
+/**
+ * @brief The position of the pair (i, d) in the list of pairs (I0, D0), Rest... given as
+ * I0, D0, I1, D1, ... Like value_position(), used for (index value, direction) pairs of the
+ * references to a field with a loop local index and direction, e.g.
+ * pair_position<0, 7, 1, 6>(mu, -mu) for U[mu][X - mu].
+ */
+template <int64_t I0, int64_t D0, int64_t... Rest>
+DEVICE constexpr inline int pair_position(const int64_t i, const int64_t d) {
+    static_assert(sizeof...(Rest) % 2 == 0, "pairs of (index value, direction) needed");
+    if constexpr (sizeof...(Rest) == 0) {
+        (void)i;
+        (void)d;
+        return 0;
+    } else {
+        return (i == I0 && d == D0) ? 0 : 1 + pair_position<Rest...>(i, d);
+    }
+}
+} // namespace hila
 
 /*
 Import backend

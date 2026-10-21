@@ -1002,6 +1002,19 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
                 return "hila::select_storage<" + values + ">(static_cast<int64_t>(" +
                        loopBuf.get(ref->ref_index->getSourceRange()) + ")" + storages + ")";
             };
+
+            // the references read into arrays at the start of the kernel, see
+            // preload_loop_local_refs(). Faster if the loops over the index are unrolled
+            std::set<const field_ref *> preloaded;
+#ifdef FETCH_FIELD_REFS_LOOP_LOCAL
+            preloaded = preload_loop_local_refs(
+                l, kernel, loopBuf, looping_var,
+                [](const std::string &name, const std::string &index) {
+                    return name + ".get(" + index + ", _dev_field_alloc_size)";
+                },
+                nb_index);
+#endif
+
             for (dir_ptr &d : l.dir_list) {
                 std::string dirname;
                 if (d.deep_k == 0) {
@@ -1011,6 +1024,8 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
                         dirname = remove_X(loopBuf.get(d.parityExpr->getSourceRange()));
                 }
                 for (field_ref *ref : d.ref_list) {
+                    if (preloaded.count(ref) > 0)
+                        continue;
                     const std::string storage = storage_of(ref);
                     const std::string index =
                         (d.deep_k > 0) ? deep_index(d) : nb_index(storage, dirname);
@@ -1019,7 +1034,7 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
                 }
             }
             for (field_ref *ref : l.ref_list)
-                if (!ref->is_direction)
+                if (!ref->is_direction && preloaded.count(ref) == 0)
                     loopBuf.replace(ref->fullExpr, storage_of(ref) + ".get(" + looping_var +
                                                        ", _dev_field_alloc_size)");
             continue;

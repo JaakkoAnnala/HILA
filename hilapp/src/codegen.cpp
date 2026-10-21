@@ -347,6 +347,141 @@ void TopLevelVisitor::handle_field_info(std::stringstream &code, bool is_cow, St
 
 ///////////////////////////////////////////////////////////////////////////////////
 
+/// Used with FETCH_FIELD_REFS_LOOP_LOCAL, not used by default, seems to be slower...
+/// For a field with a loop local index, e.g. U[mu] inside
+/// foralldir(mu): read all the elements the references can use into arrays at the start of the
+/// loop body and replace the references with array accesses. E.g. for U[mu][X] and U[mu][X - mu]
+/// with mu = e_x, e_y:
+///   const T HILA_U_at_X[2] = {get(U_0, X), get(U_1, X)};
+///   const T HILA_U_dir1[2] = {get(U_0, X - e_x), get(U_1, X - e_y)};
+/// and U[mu][X - mu] -> HILA_U_dir1[hila::pair_position<0, 7, 1, 6>(mu, -mu)].
+/// The positions are constants if the loop over mu is unrolled.
+/// NOTE: all elements are read even if a reference is not executed for every value, e.g. if it is
+/// inside a branch.
+///
+/// `get(name, index)` is the expression of the element at `index` of the Field variable `name`
+/// (one of l.outside_loop_names()), `nb_index(name, dir)` the index of the neighbour to `dir`.
+/// Returns the references that were replaced. The rest, refs to the deep halo or with
+/// unknown directions, are left for the caller.
+std::set<const field_ref *> TopLevelVisitor::preload_loop_local_refs(
+    const field_info &l, std::stringstream &code, srcBuf &loopBuf, const std::string &looping_var,
+    const std::function<std::string(const std::string &, const std::string &)> &get,
+    const std::function<std::string(const std::string &, const std::string &)> &nb_index) {
+
+    std::set<const field_ref *> preloaded;
+
+    const std::vector<std::string> names = l.outside_loop_names();
+    std::map<int64_t, std::string> name_of; // index value -> Field variable
+    std::string value_list;
+    auto name_it = names.begin();
+    for (int64_t v : l.ref_idx_set) {
+        name_of[v] = *name_it++;
+        value_list += (value_list.empty() ? "" : ", ") + std::to_string(v);
+    }
+
+    auto index_of = [&](const field_ref *ref) {
+        return "static_cast<int64_t>(" + loopBuf.get(ref->ref_index->getSourceRange()) + ")";
+    };
+
+    // declare array `array` with elements `elems` and return its name. If an array with the same
+    // elements exists, e.g. for X - mu in two foralldir(mu) loops, return the name of that instead
+    std::map<std::vector<std::string>, std::string> arrays;
+    auto declare_array = [&](const std::string &array,
+                             const std::vector<std::string> &elems) -> std::string {
+        const auto [it, is_new] = arrays.insert({elems, array});
+        if (!is_new)
+            return it->second;
+        code << "const " << l.element_type << ' ' << array << '[' << elems.size() << "] = {";
+        for (size_t i = 0; i < elems.size(); i++)
+            code << (i > 0 ? ", " : "") << elems[i];
+        code << "};\n";
+        return array;
+    };
+
+    // refs at X: one element for each index value
+    std::vector<const field_ref *> at_X;
+    for (const field_ref *ref : l.ref_list)
+        if (!ref->is_direction)
+            at_X.push_back(ref);
+    if (!at_X.empty()) {
+        std::vector<std::string> elems;
+        for (const auto &[v, name] : name_of)
+            elems.push_back(get(name, looping_var));
+        const std::string array = declare_array(l.loop_ref_name, elems);
+        for (const field_ref *ref : at_X) {
+            loopBuf.replace(ref->fullExpr, array + "[hila::value_position<" + value_list + ">(" +
+                                               index_of(ref) + ")]");
+            preloaded.insert(ref);
+        }
+    }
+
+    for (const dir_ptr &d : l.dir_list) {
+        if (d.deep_k > 0 || d.ref_list.empty())
+            continue;
+
+        std::string dirname;
+        if (d.is_constant_direction)
+            dirname = d.direxpr_s; // orig. string
+        else
+            dirname = remove_X(loopBuf.get(d.parityExpr->getSourceRange()));
+
+        bool loop_local_dir = false;
+        for (const field_ref *ref : d.ref_list)
+            if (ref->is_loop_local_dir)
+                loop_local_dir = true;
+
+        if (!loop_local_dir) {
+            // the same direction for all index values, one element for each
+            std::vector<std::string> elems;
+            for (const auto &[v, name] : name_of)
+                elems.push_back(get(name, nb_index(name, dirname)));
+            const std::string array = declare_array(d.name_with_dir, elems);
+            for (const field_ref *ref : d.ref_list) {
+                loopBuf.replace(ref->fullExpr, array + "[hila::value_position<" + value_list +
+                                                   ">(" + index_of(ref) + ")]");
+                preloaded.insert(ref);
+            }
+            continue;
+        }
+
+        // a loop local direction: one element for each (index value, direction) pair the refs
+        // use. Not possible if a pair is unknown
+        std::set<std::pair<int64_t, int64_t>> pairs;
+        bool known = true;
+        for (const field_ref *ref : d.ref_list) {
+            if (!ref->loop_local_dirs_known)
+                known = false;
+            for (const auto &p : ref->loop_local_dirs) {
+                if (name_of.count(p.first) == 0)
+                    known = false;
+                pairs.insert(p);
+            }
+        }
+        if (!known || pairs.empty())
+            continue;
+
+        std::vector<std::string> elems;
+        std::string pair_list;
+        for (const auto &[v, dir] : pairs) {
+            const std::string &name = name_of[v];
+            elems.push_back(
+                get(name, nb_index(name, "static_cast<Direction>(" + std::to_string(dir) + ")")));
+            pair_list += (pair_list.empty() ? "" : ", ") + std::to_string(v) + ", " +
+                         std::to_string(dir);
+        }
+        const std::string array = declare_array(d.name_with_dir, elems);
+        for (const field_ref *ref : d.ref_list) {
+            loopBuf.replace(ref->fullExpr, array + "[hila::pair_position<" + pair_list +
+                                               ">(" + index_of(ref) + ", static_cast<int64_t>(" +
+                                               dirname + "))]");
+            preloaded.insert(ref);
+        }
+    }
+    return preloaded;
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+
 // Handle field+offset expressions -- these are copied, ref removed
 // Use iterator for looping, because we may want to remove the field_info item.
 

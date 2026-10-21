@@ -2,6 +2,7 @@
 #define TOPLEVELVISITOR_H
 
 #include <string>
+#include <functional>
 #include "clang/AST/AST.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -238,6 +239,12 @@ class TopLevelVisitor : public GeneralVisitor, public RecursiveASTVisitor<TopLev
 
     void handle_field_plus_offsets(std::stringstream &code, srcBuf &loopbuf, std::string &par,
                                    std::string &tail);
+
+    std::set<const field_ref *> preload_loop_local_refs(
+        const field_info &l, std::stringstream &code, srcBuf &loopBuf,
+        const std::string &looping_var,
+        const std::function<std::string(const std::string &, const std::string &)> &get,
+        const std::function<std::string(const std::string &, const std::string &)> &nb_index);
 
     void generate_field_code(std::stringstream &code, bool &generate_wait_loops);
 

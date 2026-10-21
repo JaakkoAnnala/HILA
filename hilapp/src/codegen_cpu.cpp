@@ -324,6 +324,19 @@ std::string TopLevelVisitor::generate_code_cpu(Stmt *S, bool semicolon_at_end, s
             auto field_of = [&](const field_ref *ref) {
                 return "(" + loopBuf.get(ref->nameExpr->getSourceRange()) + ")";
             };
+
+            // the references read into arrays at the start of the loop body, see
+            // preload_loop_local_refs(). Faster if the loops over the index are unrolled
+            std::set<const field_ref *> preloaded;
+#ifdef FETCH_FIELD_REFS_LOOP_LOCAL
+            preloaded = preload_loop_local_refs(
+                l, code, loopBuf, looping_var,
+                [](const std::string &name, const std::string &index) {
+                    return name + ".get_value_at(" + index + ")";
+                },
+                nb_index);
+#endif
+
             for (dir_ptr &d : l.dir_list) {
                 std::string dirname;
                 if (d.deep_k == 0) {
@@ -333,6 +346,8 @@ std::string TopLevelVisitor::generate_code_cpu(Stmt *S, bool semicolon_at_end, s
                         dirname = remove_X(loopBuf.get(d.parityExpr->getSourceRange()));
                 }
                 for (field_ref *ref : d.ref_list) {
+                    if (preloaded.count(ref) > 0)
+                        continue;
                     const std::string field = field_of(ref);
                     const std::string index =
                         (d.deep_k > 0) ? deep_index(d) : nb_index(field, dirname);
@@ -340,7 +355,7 @@ std::string TopLevelVisitor::generate_code_cpu(Stmt *S, bool semicolon_at_end, s
                 }
             }
             for (field_ref *ref : l.ref_list)
-                if (!ref->is_direction)
+                if (!ref->is_direction && preloaded.count(ref) == 0)
                     loopBuf.replace(ref->fullExpr,
                                     field_of(ref) + ".get_value_at(" + looping_var + ")");
             continue;
