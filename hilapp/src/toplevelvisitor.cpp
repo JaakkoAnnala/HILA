@@ -333,74 +333,58 @@ bool TopLevelVisitor::handle_field_X_expr(Expr *e, bool &is_assign, bool is_also
     //              << " Parity " << get_stmt_str(lfe.parityExpr)
     //              << "\n";
 
-    // Check that there are no local variable references up the AST of the name
+    // Check that there are no local variable references up the AST of the name, except in the
+    // index of a field selected as base[index], e.g. U[mu][X] inside foralldir(mu). The values
+    // the index can have are found after the loop has been traversed,
+    // with analyse_loop_local_field_refs()
     FieldRefChecker frc(*this);
     frc.TraverseStmt(lfe.nameExpr);
     if (frc.isLoopLocal()) {
 
-        llvm::errs() << "Loop local var type is " << frc.getLocalVarInfo()->type << '\n';
-
-
-        ///////////////////////////
-        // TESTING:
-        Expr *tracked_expr = lfe.nameExpr;
-        // TODO: find more reliably the expr that depends on the local loop var
-        if (auto tmp = dyn_cast<CXXOperatorCallExpr>(lfe.nameExpr)) {
-            tracked_expr = tmp->getArg(1);
+        Expr *base = nullptr;
+        Expr *index = nullptr;
+        if (auto *OC = dyn_cast<CXXOperatorCallExpr>(lfe.nameExpr);
+            OC && OC->getOperator() == OO_Subscript && OC->getNumArgs() == 2) {
+            base = OC->getArg(0);
+            index = OC->getArg(1);
+        } else if (auto *ASE = dyn_cast<ArraySubscriptExpr>(lfe.nameExpr)) {
+            base = ASE->getBase();
+            index = ASE->getIdx();
         }
-        // Find enclosing FunctionDecl
-        const FunctionDecl *current_func = global.currentFunctionDecl;
-        // Find the compund statement linked to onsites loop
-        Stmt *stmt = this->parsing_state.current_loop_body;
 
+        bool base_is_loop_local = false;
+        if (base) {
+            FieldRefChecker base_frc(*this);
+            base_frc.TraverseStmt(base);
+            base_is_loop_local = base_frc.isLoopLocal();
+        }
 
-        Idx_expr_evaluator evaluator{};
-        evaluator.init(current_func, stmt, this->getASTContext());
-        evaluator.add_expr_to_tracking_list(tracked_expr);
-        bool exec_res = evaluator.exec();
-
-        if (!exec_res) {
-            // failed
-            // TODO: better error message
+        if (base == nullptr || base_is_loop_local ||
+            !index->getType()->isIntegralOrEnumerationType()) {
             reportDiag(DiagnosticsEngine::Level::Error, lfe.nameExpr->getSourceRange().getBegin(),
-                       "Could not analyse field reference that depends on an expression "
-                       "inside onsites-loop");
-            // for now print evaluator diags in any case
-            // TODO: cound print these only when we fail unexpectedly
-            llvm::outs() << "---------- Idx_expr_evaluator internal diagnostics -----------\n";
-            evaluator.print_eval_diags(llvm::errs());
-            llvm::outs() << "--------------------------------------------------------------\n";
+                       "Field reference cannot depend on variable '%0' defined inside "
+                       "onsites-loop, except through the index in field[index]",
+                       frc.getLocalVarInfo()->name.c_str());
+        } else if (lfe.is_written) {
+            reportDiag(DiagnosticsEngine::Level::Error, lfe.nameExpr->getSourceRange().getBegin(),
+                       "Assignment to a Field selected with an index that depends on variable "
+                       "'%0' defined inside onsites-loop is not supported",
+                       frc.getLocalVarInfo()->name.c_str());
+        } else if (lfe.is_offset) {
+            reportDiag(DiagnosticsEngine::Level::Error, lfe.nameExpr->getSourceRange().getBegin(),
+                       "Offset reference to a Field selected with an index that depends on "
+                       "variable '%0' defined inside onsites-loop is not supported",
+                       frc.getLocalVarInfo()->name.c_str());
+        } else if (target.kernelize || target.vectorize || target.openacc) {
+            reportDiag(DiagnosticsEngine::Level::Error, lfe.nameExpr->getSourceRange().getBegin(),
+                       "Field selected with an index that depends on variable '%0' defined "
+                       "inside onsites-loop is supported only with the plain CPU target TODO!",
+                       frc.getLocalVarInfo()->name.c_str());
         } else {
-            // We executed without problems, check if we could track the expr
-            auto pair = evaluator.get_vals_for_expr(tracked_expr);
-            const auto *vals = pair.first;
-            bool ok = pair.second;
-            if (!ok) {
-                // TODO: better error message
-                reportDiag(DiagnosticsEngine::Level::Error,
-                           lfe.nameExpr->getSourceRange().getBegin(),
-                           "Could not analyse field reference that depends on an expression "
-                           "inside onsites-loop");
-            }
-            assert(vals != nullptr);
-            // Do somethig
+            lfe.is_loop_local_ref = true;
+            lfe.ref_base = base;
+            lfe.ref_index = index;
         }
-
-        // test printing:
-        evaluator.print_vals_for_expr(llvm::outs(), tracked_expr);
-        // print diagnostics accumulated during eval
-
-
-        // Print tracked values
-        llvm::outs() << "------- main_state.all_possible_vals -------\n";
-        evaluator.print_all_vals_vars(llvm::outs());
-        llvm::outs() << "------- main_state.possible_vals_for_expr -------\n";
-        evaluator.print_all_vals_exprs(llvm::outs());
-        ///////////////////////////
-
-        reportDiag(DiagnosticsEngine::Level::Error, lfe.nameExpr->getSourceRange().getBegin(),
-                   "Field reference cannot depend on variable '%0' defined inside onsites-loop",
-                   frc.getLocalVarInfo()->name.c_str());
     }
 
     if (contains_random(lfe.fullExpr)) {
@@ -1112,6 +1096,7 @@ bool TopLevelVisitor::handle_full_loop_stmt(Stmt *ls, bool field_parity_ok) {
     // check and analyze the field expressions
     check_var_info_list();
     check_addrofops_and_refs(ls); // scan through the full loop again
+    analyse_loop_local_field_refs(ls);
     check_field_ref_list();
     process_loop_functions(); // revisit functions when vars are fully resolved
 
@@ -1653,6 +1638,59 @@ bool TopLevelVisitor::TraverseDecl(Decl *D) {
 /// construct the field_info_list
 //////////////////////////////////////////////////////////////////////////////
 
+
+/// Find the values the index of a field reference like U[mu][X], where mu is
+/// defined inside the site loop, can have. All of them are found with one
+/// Idx_expr_evaluator run over the loop body. Returns false if we are unable to analyze the
+/// expression
+bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
+
+    bool any = false;
+    for (field_ref &r : field_ref_list)
+        if (r.is_loop_local_ref)
+            any = true;
+    if (!any)
+        return true;
+
+    Idx_expr_evaluator evaluator{};
+    bool ok = evaluator.init(global.currentFunctionDecl, loop_body, getASTContext());
+    if (ok) {
+        for (field_ref &r : field_ref_list)
+            if (r.is_loop_local_ref)
+                evaluator.add_expr_to_tracking_list(r.ref_index);
+        ok = evaluator.exec();
+    }
+
+    bool all_found = ok;
+    for (field_ref &r : field_ref_list) {
+        if (!r.is_loop_local_ref)
+            continue;
+
+        const auto [vals, reliable] = evaluator.get_vals_for_expr(r.ref_index);
+        if (!ok || vals == nullptr || !reliable) {
+            reportDiag(DiagnosticsEngine::Level::Error, r.ref_index->getSourceRange().getBegin(),
+                       "Could not determine the values index '%0' of Field '%1' can have in the "
+                       "onsites-loop",
+                       get_stmt_str(r.ref_index).c_str(), get_stmt_str(r.nameExpr).c_str());
+            all_found = false;
+            continue;
+        }
+        r.ref_idx_set.clear();
+        for (const std::optional<int64_t> &v : *vals)
+            r.ref_idx_set.insert(v.value());
+    }
+
+    if (!all_found) {
+        // TODO: print these only with a command line option?
+        llvm::errs() << "---------- Idx_expr_evaluator internal diagnostics -----------\n";
+        evaluator.print_eval_diags(llvm::errs());
+        llvm::errs() << "--------------------------------------------------------------\n";
+    }
+    return all_found;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
 bool TopLevelVisitor::check_field_ref_list() {
 
     bool no_errors = true;
@@ -1668,9 +1706,19 @@ bool TopLevelVisitor::check_field_ref_list() {
         field_info *fip = nullptr;
 
         // search for duplicates: if found, lfip is non-null
+        // Fields with a loop local index and the same base, e.g. U[mu] in two foralldir(mu)
+        // loops or U[mu] and U[nu], are the same: they have the same set of fields they can be,
+        // and in the loop body each reference uses its own expression.
+        std::string ref_index_type;
+        if (p.is_loop_local_ref)
+            ref_index_type =
+                p.ref_index->getType().getUnqualifiedType().getCanonicalType().getAsString(PP);
 
         for (field_info &li : field_info_list) {
-            if (is_duplicate_expr(li.nameExpr, p.nameExpr)) {
+            if (p.is_loop_local_ref
+                    ? (li.is_loop_local_ref && li.ref_base_str == get_stmt_str(p.ref_base) &&
+                       li.ref_index_type == ref_index_type)
+                    : (!li.is_loop_local_ref && is_duplicate_expr(li.nameExpr, p.nameExpr))) {
                 //  if (name.compare(li.old_name) == 0) {
                 fip = &li;
                 break;
@@ -1697,12 +1745,21 @@ bool TopLevelVisitor::check_field_ref_list() {
 
             lfv.nameExpr = p.nameExpr; // store the first nameExpr to this field
 
+            if (p.is_loop_local_ref) {
+                lfv.is_loop_local_ref = true;
+                lfv.ref_base_str = get_stmt_str(p.ref_base);
+                lfv.ref_index_type = ref_index_type;
+            }
+
             field_info_list.push_back(lfv);
             fip = &field_info_list.back();
         }
         // now fip points to the right info element
         // copy that to lf reference
         p.info = fip;
+
+        // a field with a loop local index may be any of the fields with the possible values
+        fip->ref_idx_set.insert(p.ref_idx_set.begin(), p.ref_idx_set.end());
 
         if (p.is_written && !fip->is_written) {
             // first write to this field var
@@ -1786,6 +1843,32 @@ bool TopLevelVisitor::check_field_ref_list() {
                     }
                     l.is_read_offset = true;
                 }
+            }
+        }
+    }
+
+    // A field with a loop local index, e.g. U[mu], may be the same Field as a field written in
+    // the loop, e.g. U[e_x]. That is not supported..
+    for (field_info &l : field_info_list) {
+        if (!l.is_loop_local_ref)
+            continue;
+        for (field_info &w : field_info_list) {
+            if (!w.is_written)
+                continue;
+            std::string w_base = w.old_name;
+            Expr *wn = w.nameExpr->IgnoreParenImpCasts();
+            if (auto *OC = dyn_cast<CXXOperatorCallExpr>(wn);
+                OC && OC->getOperator() == OO_Subscript && OC->getNumArgs() == 2)
+                w_base = get_stmt_str(OC->getArg(0));
+            else if (auto *ASE = dyn_cast<ArraySubscriptExpr>(wn))
+                w_base = get_stmt_str(ASE->getBase());
+
+            if (w_base == l.ref_base_str || w.old_name == l.ref_base_str) {
+                reportDiag(DiagnosticsEngine::Level::Error, l.nameExpr->getSourceRange().getBegin(),
+                           "Field '%0' may be the same Field as '%1', which is assigned to in "
+                           "the onsites-loop. This is not supported.",
+                           l.old_name.c_str(), w.old_name.c_str());
+                no_errors = false;
             }
         }
     }
@@ -2786,11 +2869,9 @@ void TopLevelVisitor::specialize_function_or_method(FunctionDecl *f) {
             // Normal case, just add the declared return type.
             // fully qualified: the specialization may be outside the namespace where the
             // type names are visible
-            funcBuf.insert(0,
-                           TypeName::getFullyQualifiedName(f->getDeclaredReturnType(), *Context,
-                                                           PP) +
-                               " ",
-                           true, true);
+            funcBuf.insert(
+                0, TypeName::getFullyQualifiedName(f->getDeclaredReturnType(), *Context, PP) + " ",
+                true, true);
         }
     }
 
@@ -2836,7 +2917,8 @@ void TopLevelVisitor::specialize_function_or_method(FunctionDecl *f) {
     // insert after the current toplevedecl
     std::stringstream sb;
     sb << "\n\n// ++++++++ hilapp generated function/method specialization\n"
-       << funcBuf.dump() << "\n// ++++++++\n\n" << spec_post;
+       << funcBuf.dump() << "\n// ++++++++\n\n"
+       << spec_post;
 
     // buffer is not necessarily in toplevelBuf, so:
 
@@ -2990,8 +3072,7 @@ bool TopLevelVisitor::handle_global_var_decl(Decl *D) {
                 // with a macro expanding to nothing (e.g. HILA_GPU_EXTERN), so look from the
                 // first non-blank character of the line
                 SourceLocation line_start = srcMgr.getExpansionLoc(D->getBeginLoc());
-                while (line_start.isValid() &&
-                       srcMgr.getFileOffset(line_start) > 0 &&
+                while (line_start.isValid() && srcMgr.getFileOffset(line_start) > 0 &&
                        getChar(line_start.getLocWithOffset(-1)) != '\n')
                     line_start = line_start.getLocWithOffset(-1);
                 while (line_start.isValid() && std::isspace(getChar(line_start)) &&
@@ -3479,8 +3560,7 @@ bool TopLevelVisitor::collect_axis_offset_terms(Expr *e, int sign, bool &has_X,
 
 /// Parse X + k*dir, where all Direction expressions are identical.  dirE gets the
 /// Direction expr, k the multiplier (can be negative), atoms all Direction subexpressions
-bool TopLevelVisitor::parse_axis_offset(Expr *e, Expr *&dirE, int &k,
-                                        std::vector<Expr *> &atoms) {
+bool TopLevelVisitor::parse_axis_offset(Expr *e, Expr *&dirE, int &k, std::vector<Expr *> &atoms) {
     bool has_X = false;
     std::vector<std::pair<int, Expr *>> terms;
     if (!collect_axis_offset_terms(e, 1, has_X, terms) || !has_X || terms.size() == 0)
@@ -3516,8 +3596,10 @@ void TopLevelVisitor::generate_deep_gathers(std::stringstream &code) {
     for (field_info &l : field_info_list)
         for (dir_ptr &d : l.dir_list)
             if (d.deep_k > 0)
-                code << l.new_name << ".gather_depth(" << deep_dir_string(d, dummy, false)
-                     << ", " << d.deep_k << ");\n";
+                // a field with a loop local index has a Field variable for each field it can be
+                for (const std::string &name : l.outside_loop_names())
+                    code << name << ".gather_depth(" << deep_dir_string(d, dummy, false) << ", "
+                         << d.deep_k << ");\n";
 }
 
 bool TopLevelVisitor::has_deep_refs() {

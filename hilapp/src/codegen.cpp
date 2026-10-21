@@ -267,6 +267,18 @@ void TopLevelVisitor::handle_field_info(std::stringstream &code, bool is_cow, St
             d.name_with_dir = l.new_name + "_dir" + std::to_string(++i);
         }
 
+        if (l.is_loop_local_ref) {
+            // A field with a loop local index, e.g. U[mu], can not be referred to here. Make a
+            // ref to each field it can be, these are not written to..
+            const std::vector<std::string> names = l.outside_loop_names();
+            auto idx = l.ref_idx_set.begin();
+            for (const std::string &name : names) {
+                code << "const Field" << l.type_template << " & " << name << " = "
+                     << l.loop_local_ref_expr(*idx++) << ";\n";
+            }
+            continue;
+        }
+
         // make a ref to the field name
         if (!l.is_written)
             code << "const ";
@@ -276,9 +288,11 @@ void TopLevelVisitor::handle_field_info(std::stringstream &code, bool is_cow, St
     // check alloc and do it if needed
     for (field_info &l : field_info_list)
         if (l.is_written) {
-            code << l.new_name << ".check_alloc();\n";
-            if (is_cow) {
-                code << l.new_name << ".will_change();\n";
+            for (const std::string &name : l.outside_loop_names()) {
+                code << name << ".check_alloc();\n";
+                if (is_cow) {
+                    code << name << ".will_change();\n";
+                }
             }
         }
 
@@ -320,8 +334,14 @@ void TopLevelVisitor::handle_field_info(std::stringstream &code, bool is_cow, St
             // }
         }
 
-        code << l.new_name << ".check_init(\"" << l.old_name << "\", " << init_par
-             << ", hila_this_file, " << get_linenumber(S) << ");\n";
+        const std::vector<std::string> names = l.outside_loop_names();
+        auto idx = l.ref_idx_set.begin();
+        for (const std::string &name : names) {
+            const std::string field_str =
+                l.is_loop_local_ref ? l.loop_local_ref_expr(*idx++) : l.old_name;
+            code << name << ".check_init(\"" << field_str << "\", " << init_par
+                 << ", hila_this_file, " << get_linenumber(S) << ");\n";
+        }
     }
 }
 
@@ -519,7 +539,8 @@ void TopLevelVisitor::mark_fields_changed(std::stringstream &code) {
     // finally mark modified fields
     for (field_info &l : field_info_list)
         if (l.is_written) {
-            code << l.new_name << ".mark_changed(" << loop_info.parity_str << ");\n";
+            for (const std::string &name : l.outside_loop_names())
+                code << name << ".mark_changed(" << loop_info.parity_str << ");\n";
         }
 }
 

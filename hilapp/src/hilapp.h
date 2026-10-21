@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 #include <list>
+#include <set>
+#include <cstdlib>
 #include <iostream>
 
 #include "clang/AST/AST.h"
@@ -150,6 +152,14 @@ struct field_ref {
     Expr *deep_dirExpr; // the Direction expression
     bool deep_negate;   // if true, the direction is -(deep_dirExpr)
 
+    // field accessed with index that depends on a loop local variable, eg U[mu] inside
+    // foralldir(mu). Only the form base[index] is supported, ref_base is "U" and ref_index "mu".
+    // ref_idx_set holds the values the index can have, obtained from analyse_loop_local_field_refs()
+    bool is_loop_local_ref;
+    Expr *ref_base;
+    Expr *ref_index;
+    std::set<int64_t> ref_idx_set;
+
     field_ref() {
         fullExpr = nameExpr = parityExpr = nullptr;
         direxpr_s.clear();
@@ -160,6 +170,8 @@ struct field_ref {
         deep_k = 0;
         deep_dirExpr = nullptr;
         deep_negate = false;
+        is_loop_local_ref = false;
+        ref_base = ref_index = nullptr;
     }
 
     ~field_ref() {
@@ -272,12 +284,37 @@ struct field_info {
     bool is_loop_local_dir; // is read with loop local direction?
     int first_assign_seq;   // the sequence of the first assignment
 
+    // A field accessed with a loop local index, e.g. U[mu] inside foralldir(mu)
+    // fields in arrays (like GaugeField) can not be referred to outside the loop with old_name. Instead there is one
+    // Field variable for each possible index value, generate names with outside_loop_names()
+    bool is_loop_local_ref;
+    std::string ref_base_str;      // ge "U" in U[mu]
+    std::string ref_index_type;    // type of the index, eg "Direction"
+    std::set<int64_t> ref_idx_set; // all possible values the index takes
+
     field_info() {
         type_template = old_name = new_name = loop_ref_name = "";
         is_written = is_read_nb = is_read_atX = is_read_offset = is_loop_local_dir = false;
+        is_loop_local_ref = false;
         first_assign_seq = 0;
         dir_list = {};
         ref_list = {};
+    }
+
+    /// The expression of the field for the index value `idx`, e.g. "U[static_cast<Direction>(0)]"
+    std::string loop_local_ref_expr(int64_t idx) const {
+        return ref_base_str + "[static_cast<" + ref_index_type + ">(" + std::to_string(idx) + ")]";
+    }
+
+    /// The Field variables to use before and after the loop, e.g. for gathers: new_name, or for a
+    /// field with a loop local index, need a variable for each possible index value..
+    std::vector<std::string> outside_loop_names() const {
+        if (!is_loop_local_ref)
+            return {new_name};
+        std::vector<std::string> names;
+        for (int64_t idx : ref_idx_set)
+            names.push_back(new_name + "_" + (idx < 0 ? "m" : "") + std::to_string(std::abs(idx)));
+        return names;
     }
 
     ~field_info() {
