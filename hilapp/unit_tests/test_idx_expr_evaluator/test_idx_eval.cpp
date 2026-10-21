@@ -13,6 +13,8 @@ using namespace clang::ast_matchers;
 #include "tracked_var.h"
 
 #include <cstdlib>
+#include <set>
+#include <functional>
 
 #include "../../src/idx_expr_evaluator.h"
 #define DIAGS_TO_STR
@@ -92,6 +94,12 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
     // set if the test input itself does not compile
     bool input_has_errors = false;
 
+    // The values of the arguments of track_pair(a, b) calls in the test function, tracked
+    // together with Idx_expr_evaluator::add_tuple_to_tracking_list(): the union of the tuples of
+    // all calls. pairs_reliable is false if an unknown value was recorded.
+    Tuple_set pairs;
+    bool pairs_reliable = true;
+
   public:
     void run(const MatchFinder::MatchResult &Result) override {
         diags.enable_colors(true);
@@ -117,7 +125,31 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
         if (g_max_block_states != 0)
             evaluator.main_state.max_block_states = g_max_block_states;
 
+        // track the arguments of track_pair(a, b) calls together
+        std::vector<const CallExpr *> track_pair_calls;
+        std::function<void(const Stmt *)> find_track_pair_calls = [&](const Stmt *S) {
+            if (S == nullptr)
+                return;
+            if (const auto *CE = dyn_cast<CallExpr>(S)) {
+                if (const FunctionDecl *callee = CE->getDirectCallee();
+                    callee && callee->getNameAsString() == "track_pair" && CE->getNumArgs() == 2)
+                    track_pair_calls.push_back(CE);
+            }
+            for (const Stmt *child : S->children())
+                find_track_pair_calls(child);
+        };
+        find_track_pair_calls(FB);
+        for (const CallExpr *CE : track_pair_calls)
+            evaluator.add_tuple_to_tracking_list(CE, {CE->getArg(0), CE->getArg(1)});
+
         exec_ret = evaluator.exec();
+
+        for (const CallExpr *CE : track_pair_calls) {
+            const auto [tuples, reliable] = evaluator.get_tuples_for_expr(CE);
+            if (tuples)
+                pairs.insert(tuples->begin(), tuples->end());
+            pairs_reliable = pairs_reliable && reliable;
+        }
 
         // After ToolInvocation the Compiler context may get freed so store the names now
         // Use the pointers as keys
@@ -165,6 +197,8 @@ class TestFunctionAnalyzer : public MatchFinder::MatchCallback {
     Invocation.setDiagnosticConsumer(&test_diag_consumer);                                         \
     const auto &test_state = test_analyzer.evaluator.main_state;                                   \
     const auto &test_names = test_analyzer.names;                                                  \
+    (void)test_state; /* not all tests use these */                                               \
+    (void)test_names;                                                                              \
     Invocation.run();                                                                              \
     if (test_analyzer.input_has_errors) {                                                          \
         test_pass = false;                                                                         \
@@ -200,7 +234,11 @@ template <typename T>
 inline void print_set(raw_ostream &os, const std::set<T> &set) {
     os << "[ ";
     for (auto val : set) {
-        os << val << ", ";
+        // print char types as numbers, not as (possibly unprintable) characters
+        if constexpr (std::is_integral_v<T> && sizeof(T) == 1)
+            os << static_cast<int>(val) << ", ";
+        else
+            os << val << ", ";
     }
     os << "]\n";
 }
@@ -280,6 +318,39 @@ inline bool compare_var_expect(std::string var_name, const std::set<T> &expected
             print_var_result(#VAR);                                                                \
         } else if (g_verbosity >= 2) {                                                             \
             print_var_result(#VAR);                                                                \
+        }                                                                                          \
+    } while (0)
+
+inline void print_tuples(raw_ostream &os, const Tuple_set &tuples) {
+    os << "[ ";
+    for (const Value_tuple &t : tuples) {
+        os << "(";
+        for (size_t i = 0; i < t.size(); ++i)
+            os << (i ? ", " : "") << t[i];
+        os << ") ";
+    }
+    os << "]\n";
+}
+
+// Compare the pairs recorded for the track_pair(a, b) calls in the evaluated code (see
+// TestFunctionAnalyzer::pairs) against PAIRS, a std::set<std::vector<int64_t>> recorded by the
+// normally run code.
+#define COMPARE_PAIRS_AND_SET_TEST_PASS(PAIRS)                                                     \
+    do {                                                                                           \
+        Tuple_set expected_pairs;                                                                  \
+        for (const auto &p : PAIRS)                                                                \
+            expected_pairs.insert(Value_tuple(p.begin(), p.end()));                                \
+        if (!test_analyzer.pairs_reliable || test_analyzer.pairs != expected_pairs) {              \
+            test_pass = false;                                                                     \
+            color_msg(test_out(), RED, "Results differ for track_pair", true, __FILE__, __LINE__)  \
+                << "\n";                                                                           \
+            test_out() << "Pairs result: ";                                                        \
+            print_tuples(test_out(), test_analyzer.pairs);                                         \
+            test_out() << "Pairs expect: ";                                                        \
+            print_tuples(test_out(), expected_pairs);                                              \
+        } else if (g_verbosity >= 2) {                                                             \
+            test_out() << "Pairs result: ";                                                        \
+            print_tuples(test_out(), test_analyzer.pairs);                                         \
         }                                                                                          \
     } while (0)
 
@@ -1389,6 +1460,39 @@ bool test_bool_and_char_literals() {
     TEST_CASE_END;
 }
 
+bool test_unevaluated_operands() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // The operands of sizeof and decltype are not evaluated: i++ does not increment i
+    TEST_EVAL_STRING_CSTMT(R"(
+    int i = 0;
+    int s = 0;
+    s = sizeof(i++);
+    s = sizeof i++;
+    decltype(i++) t = 0;
+    i += 1;
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunevaluated-expression"
+#pragma clang diagnostic ignored "-Wunused-variable"
+    TrackedVar<int> i = 0;
+    TrackedVar<int> s = 0;
+    s = sizeof(i++);
+    s = sizeof i++;
+    decltype(i++) t = 0;
+    i += 1;
+#pragma clang diagnostic pop
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(i);
+    COMPARE_AND_SET_TEST_PASS(s);
+
+    TEST_CASE_END;
+}
+
 bool test_floating_point_is_unknown() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -1532,6 +1636,139 @@ constexpr auto opp_dir = [](Dir d){
     /////////////////////////////////////////////
     COMPARE_AND_SET_TEST_PASS(sum);
     COMPARE_AND_SET_TEST_PASS(opp);
+
+    TEST_CASE_END;
+}
+
+bool test_pair_tracking_correlated() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // The values of i and j tracked together: only the 6 combinations that occur, not all 9
+    TEST_EVAL_STRING_TOPLVL(R"(
+void track_pair(long a, long b);
+void test(){
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            if (i != j) track_pair(i, j);
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+std::set<std::vector<int64_t>> pairs;
+// void track_pair(long a, long b);
+auto track_pair = [&](long a, long b) { pairs.insert({a, b}); };
+//void test(){
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            if (i != j) track_pair(i, j);
+//}
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_PAIRS_AND_SET_TEST_PASS(pairs);
+
+    TEST_CASE_END;
+}
+
+bool test_pair_tracking_direction_like() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Like the field index and direction in U[mu][X - mu] inside foralldir(mu)
+    TEST_EVAL_STRING_TOPLVL(R"(
+enum Dir : unsigned { e_x = 0, e_y, e_z, e_z_down, e_y_down, e_x_down, NDIRS };
+constexpr Dir next_dir(Dir d){
+    return static_cast<Dir>(static_cast<unsigned>(d) + 1);
+}
+constexpr Dir opp_dir(Dir d){
+    return static_cast<Dir>(NDIRS - 1 - static_cast<int>(d));
+}
+void track_pair(long a, long b);
+void test(){
+    for (Dir d = e_x; d < 3; d = next_dir(d))
+        track_pair(d, opp_dir(d));
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+// local enum and lambdas so we can keep them contained in the test function ...
+enum Dir : unsigned { e_x = 0, e_y, e_z, e_z_down, e_y_down, e_x_down, NDIRS };
+// constexpr Dir next_dir(Dir d){
+constexpr auto next_dir = [](Dir d){
+    return static_cast<Dir>(static_cast<unsigned>(d) + 1);
+};
+// constexpr Dir opp_dir(Dir d){
+constexpr auto opp_dir = [](Dir d){
+    return static_cast<Dir>(NDIRS - 1 - static_cast<int>(d));
+};
+std::set<std::vector<int64_t>> pairs;
+// void track_pair(long a, long b);
+auto track_pair = [&](long a, long b) { pairs.insert({a, b}); };
+//void test(){
+    for (Dir d = e_x; d < 3; d = next_dir(d))
+        track_pair(d, opp_dir(d));
+//}
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_PAIRS_AND_SET_TEST_PASS(pairs);
+
+    TEST_CASE_END;
+}
+
+bool test_pair_tracking_unknown_branch() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // Both branches of the unknown condition, but a and b stay correlated: (0, 0) and (1, 10),
+    // not (0, 10) or (1, 0)
+    TEST_EVAL_STRING_TOPLVL(R"(
+void track_pair(long a, long b);
+extern int y;
+void test(){
+    int a = 0;
+    if (y > 0) a = 1;
+    int b = a * 10;
+    track_pair(a, b);
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it, for values of the unknown `y` that take every branch
+std::set<std::vector<int64_t>> pairs;
+// void track_pair(long a, long b);
+auto track_pair = [&](long a, long b) { pairs.insert({a, b}); };
+// extern int y;
+for (int y : {0, 1}) {
+//void test(){
+    int a = 0;
+    if (y > 0) a = 1;
+    int b = a * 10;
+    track_pair(a, b);
+//}
+}
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_PAIRS_AND_SET_TEST_PASS(pairs);
+
+    TEST_CASE_END;
+}
+
+bool test_pair_tracking_unknown_value() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // A member with an unknown value makes the tuples unreliable
+    TEST_EVAL_STRING_TOPLVL(R"(
+void track_pair(long a, long b);
+extern int y;
+void test(){
+    int i = 0;
+    track_pair(i, y);
+}
+    )")
+    /////////////////////////////////////////////
+    // The value of y is not known, so the pairs can not be compared.
+    /////////////////////////////////////////////
+    if (!test_analyzer.exec_ret || test_analyzer.pairs_reliable || test_analyzer.pairs.size() != 1)
+        test_pass = false;
 
     TEST_CASE_END;
 }
@@ -2311,6 +2548,7 @@ static std::vector<test_func> test_cases = {
     // types, constants and other kinds of expressions
     test_other_expression_kinds,
     test_bool_and_char_literals,
+    test_unevaluated_operands,
     test_floating_point_is_unknown,
     test_unsigned_and_narrowing,
     test_constants_declared_outside,
@@ -2319,6 +2557,12 @@ static std::vector<test_func> test_cases = {
     //
     test_lots_of_control_flow_things_1,
     test_lots_of_control_flow_things_2,
+
+    // tracking the values of several expressions together
+    test_pair_tracking_correlated,
+    test_pair_tracking_direction_like,
+    test_pair_tracking_unknown_branch,
+    test_pair_tracking_unknown_value,
 
     // unknown conditions
     test_unknown_branch,

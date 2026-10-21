@@ -35,6 +35,10 @@ using namespace clang;
 
 using Value_set = std::set<std::optional<int64_t>>;
 
+// values of multiple exprs tracked together
+using Value_tuple = std::vector<std::optional<int64_t>>;
+using Tuple_set = std::set<Value_tuple>;
+
 struct Eval_result {
     std::optional<int64_t> val = std::nullopt;
 };
@@ -92,6 +96,11 @@ struct Eval_state {
 
     // maps the Expr* to all its possible values it obtains during evaluation
     std::unordered_map<const Expr *, Value_set> possible_vals_for_expr;
+
+    // Exprs whose values are tracked together: main_expr -> child_exprs, and main_expr -> the
+    // tuples of the values of the child_exprs recorded when the anchor was evaluated
+    std::unordered_map<const Expr *, std::vector<const Expr *>> tracked_tuples;
+    std::unordered_map<const Expr *, Tuple_set> possible_tuples_for_expr;
     // set to true if `possible_vals_for_expr` has reliable results
     bool eval_succeeded = false;
 
@@ -105,6 +114,17 @@ struct Idx_expr_evaluator {
     bool init(const FunctionDecl *func, Stmt *statement_in_the_func, ASTContext *ASTctx);
 
     void add_expr_to_tracking_list(const Expr *E);
+
+    /**
+     * @brief Track the values of the expressions `child_exprs` together: each time `main_expr` is
+     * evaluated, the values the child_exprs have in that state are saved as one tuple.
+     * @details  this keeps only the combinations of values that occur. E.g. for (field index,
+     * direction) in U[mu][X - mu] inside foralldir(mu) the tuples are (e_x, e_x), (e_y, e_y) ...
+     * and not all pairs. The child_exprs have to be evaluated before the main_expr in the same CFG
+     * block, typically they are subexpressions of it. Otherwise an unknown value is recorded for
+     * them.
+     */
+    void add_tuple_to_tracking_list(const Expr *main_expr, std::vector<const Expr *> child_exprs);
 
     // Evaluate all execution paths through the statement given to init() with a worklist: a
     // condition with an unknown value follows both branches. Sets main_state.eval_succeeded.
@@ -121,6 +141,15 @@ struct Idx_expr_evaluator {
      * note: Empty set is a valid return.
      */
     std::pair<const Value_set *, bool> get_vals_for_expr(Expr *E) const;
+
+    /**
+     * @param main_expr given to add_tuple_to_tracking_list()
+     * @return pair.first = the set of recorded tuples of the values of the child_exprs, nullptr if
+     * main_expr is not tracked. pair.second = false if main_expr is not tracked or if a tuple
+     * contains an unknown value (std::nullopt). note: Empty set is a valid return, the main_expr
+     * was never evaluated.
+     */
+    std::pair<const Tuple_set *, bool> get_tuples_for_expr(const Expr *main_expr) const;
 
 
     void print_vals_for_expr(llvm::raw_ostream &os, Expr *E) const;

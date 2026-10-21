@@ -829,6 +829,19 @@ successful_return:
     track_expr(result, E, state);
     state.block_expr_state[E] = result.val;
     state.last_res = result;
+
+    // record the values of the tuple based on E, see add_tuple_to_tracking_list(). The child_exprs
+    // have been evaluated before in this block, so their values are in block_expr_state.
+    if (!state.tracked_tuples.empty()) {
+        if (const auto tuple = state.tracked_tuples.find(E); tuple != state.tracked_tuples.end()) {
+            Value_tuple values;
+            for (const Expr *member : tuple->second) {
+                const auto it = state.block_expr_state.find(member);
+                values.push_back(it != state.block_expr_state.end() ? it->second : std::nullopt);
+            }
+            state.possible_tuples_for_expr[E].insert(std::move(values));
+        }
+    }
     return true;
 }
 
@@ -1107,6 +1120,26 @@ bool Idx_expr_evaluator::init(const FunctionDecl *func, Stmt *statement_in_the_f
 
 void Idx_expr_evaluator::add_expr_to_tracking_list(const Expr *E) {
     main_state.possible_vals_for_expr[E] = {}; // init as empty set
+}
+
+void Idx_expr_evaluator::add_tuple_to_tracking_list(const Expr *main_expr,
+                                                    std::vector<const Expr *> child_expr) {
+    main_state.tracked_tuples[main_expr] = std::move(child_expr);
+    main_state.possible_tuples_for_expr[main_expr] = {}; // init as empty set
+}
+
+std::pair<const Tuple_set *, bool>
+Idx_expr_evaluator::get_tuples_for_expr(const Expr *main_expr) const {
+    const auto it = main_state.possible_tuples_for_expr.find(main_expr);
+    if (it == main_state.possible_tuples_for_expr.end())
+        return {nullptr, false};
+
+    for (const Value_tuple &tuple : it->second)
+        for (const std::optional<int64_t> &value : tuple)
+            if (!value.has_value())
+                return {&it->second, false};
+
+    return {&it->second, true};
 }
 
 std::pair<const Value_set *, bool> Idx_expr_evaluator::get_vals_for_expr(Expr *E) const {
@@ -1610,6 +1643,8 @@ bool Idx_expr_evaluator::exec() {
     main_state.all_possible_vals.clear();
     for (auto &[expr, values] : main_state.possible_vals_for_expr)
         values.clear();
+    for (auto &[main_expr, tuples] : main_state.possible_tuples_for_expr)
+        tuples.clear();
 
     main_state.func_cache = &func_cache;
     main_state.eval_succeeded = eval_CFG_worklist(*cfg, main_state, *ASTctx);
