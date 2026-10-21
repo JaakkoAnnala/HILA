@@ -173,6 +173,12 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
 
         result.val = IL->getValue().getSExtValue();
         goto successful_return;
+    } else if (const auto *BL = dyn_cast<CXXBoolLiteralExpr>(E)) {
+        result.val = BL->getValue();
+        goto successful_return;
+    } else if (const auto *CL = dyn_cast<CharacterLiteral>(E)) {
+        result.val = CL->getValue();
+        goto successful_return;
     } else if (const auto *default_arg = dyn_cast<CXXDefaultArgExpr>(E)) {
         // This takes care of functions with default arguments
         Eval_result default_val{};
