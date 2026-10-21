@@ -111,6 +111,31 @@ class field_storage {
     }
 };
 
+namespace hila {
+
+/**
+ * @brief Select the storage of a field by an index value. Used by hilapp in GPU kernels for
+ * a field selected with an index that depends on a variable defined inside the site loop, e.g.
+ * U[mu] inside foralldir(mu).
+ *
+ * @details hilapp passes the storages of all fields the reference can be to the kernel:
+ * s0, ss... are the storages for the possible index values V0, Vs... found by its analysis,
+ * e.g. select_storage<0, 1, 2, 3>(mu, U0, U1, U2, U3). The index is the same for all
+ * threads. The last storage is returned without a check, the analysis guarantees that the index
+ * has one of the values.
+ */
+template <int64_t V0, int64_t... Vs, typename S, typename... Ss>
+DEVICE inline const S &select_storage(const int64_t idx, const S &s0, const Ss &...ss) {
+    static_assert(sizeof...(Vs) == sizeof...(Ss), "a storage for each index value needed");
+    if constexpr (sizeof...(Vs) == 0) {
+        (void)idx;
+        return s0;
+    } else {
+        return (idx == V0) ? s0 : select_storage<Vs...>(idx, ss...);
+    }
+}
+}
+
 /*
 Import backend
 */

@@ -375,10 +375,18 @@ bool TopLevelVisitor::handle_field_X_expr(Expr *e, bool &is_assign, bool is_also
                        "Offset reference to a Field selected with an index that depends on "
                        "variable '%0' defined inside onsites-loop is not supported",
                        frc.getLocalVarInfo()->name.c_str());
-        } else if (target.kernelize || target.vectorize || target.openacc) {
+        } else if (index->HasSideEffects(*Context)) {
+            // the index expression is repeated in the generated code, once for each access
+            reportDiag(DiagnosticsEngine::Level::Error, index->getSourceRange().getBegin(),
+                       "The index of a Field selected with an index that depends on variable "
+                       "'%0' defined inside onsites-loop cannot have side effects",
+                       frc.getLocalVarInfo()->name.c_str());
+        } else if (target.vectorize || target.openacc) {
+            // TODO: vectorized and OpenACC targets
             reportDiag(DiagnosticsEngine::Level::Error, lfe.nameExpr->getSourceRange().getBegin(),
                        "Field selected with an index that depends on variable '%0' defined "
-                       "inside onsites-loop is supported only with the plain CPU target TODO!",
+                       "inside onsites-loop is supported only with the plain CPU and GPU "
+                       "targets",
                        frc.getLocalVarInfo()->name.c_str());
         } else {
             lfe.is_loop_local_ref = true;
