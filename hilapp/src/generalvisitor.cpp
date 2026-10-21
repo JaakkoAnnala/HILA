@@ -1,6 +1,8 @@
 #include "stringops.h"
 #include "generalvisitor.h"
 
+#include <sstream>
+
 //////////////////////////////////////////////////////////////////////////////////
 ///  Implementation of some methods for generalvisitor
 ///  For full list of generalvisitor commands, see generalvisitor.h
@@ -681,7 +683,11 @@ var_info *GeneralVisitor::add_var_to_decl_list(VarDecl *var, int scope_level) {
 /// This is done only within site loops and loop functions
 ///
 
-bool GeneralVisitor::handle_global_var_method_call(CallExpr *CE) {
+/// in_kernel: the reference is in an onsites() body, which on GPUs becomes a kernel.  There
+/// only the device variable is used: HIP (clang) checks kernel bodies also in the host
+/// compilation pass, where calling the host-only operator() would be an error.
+
+bool GeneralVisitor::handle_global_var_method_call(CallExpr *CE, bool in_kernel) {
 
     bool got_error = false;
     Expr *E = nullptr;
@@ -723,17 +729,24 @@ bool GeneralVisitor::handle_global_var_method_call(CallExpr *CE) {
     }
 
     if (E) {
-        if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E)) {
+        DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E);
+        VarDecl *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+        if (VD) {
 
             if (target.kernelize) {
 
-                auto constvarname = generate_constant_var_name(DRE);
+                auto constvarname = generate_constant_var_name(VD);
 
                 SourceRange sr = CE->getSourceRange();
 
                 srcBuf *sb = get_file_srcBuf(sr.getBegin());
 
-                std::string repl = "\n#ifdef ";
+                std::string repl;
+                if (in_kernel) {
+                    sb->replace(sr, constvarname);
+                    return true;
+                }
+                repl = "\n#ifdef ";
                 if (target.cuda) {
                     repl.append("__CUDA_ARCH__");
                 } else if (target.hip) {
@@ -772,57 +785,47 @@ bool GeneralVisitor::handle_global_var_method_call(CallExpr *CE) {
 
 
 /////////////////////////////////////////////////////////////////////////
-/// Make a name for generated __constant__ variable
-/// Use this interface, in order to guarantee the same name
+/// Make a name for generated __constant__ variable of hila::global variable VD.
+/// Use this interface for both the declaration and references, in order to guarantee
+/// the same name.  The name is obtained from the declaration and its enclosing namespaces,
+/// so it does not depend on how the reference is written (A::a, a within namespace A or
+/// after using namespace A, ...).  Anonymous namespaces are named "anon_".
+///
+/// Globals which are not visible to other files (static, or in anonymous namespace) get
+/// a file-specific tag in the name.  The device variable has always external linkage:
+/// static __constant__ variables do not work with relocatable device code (-rdc).
 /////////////////////////////////////////////////////////////////////////
 
-std::string GeneralVisitor::generate_constant_var_name(const std::string &varname, bool isnamespace,
-                                                       const std::string &nspace) {
+std::string GeneralVisitor::generate_constant_var_name(const VarDecl *VD) {
 
-    std::string name("HILA_device_constant_");
+    VD = VD->getCanonicalDecl();
 
-    if (isnamespace) {
-        name.append(nspace);
-        name.append("__");
+    std::string file_tag;
+    if (!VD->isExternallyVisible()) {
+        // tag from the path of the compiled source file
+        std::string path =
+            srcMgr.getFilename(srcMgr.getLocForStartOfFile(srcMgr.getMainFileID())).str();
+        std::stringstream ss;
+        ss << "f" << std::hex << (std::hash<std::string>{}(path) & 0xffffffffffULL) << "_";
+        file_tag = ss.str();
     }
 
-    name.append(varname);
-
-    for (int i = 0; i < name.size(); i++)
-        if (name[i] == ':')
-            name[i] = '_';
-
-    return name;
-}
-
-/////////////////////////////////////////////////////////////////////////
-/// Generate varname from DeclRefExpr
-/////////////////////////////////////////////////////////////////////////
-
-std::string GeneralVisitor::generate_constant_var_name(DeclRefExpr *DRE) {
-
-    std::string varname = DRE->getNameInfo().getAsString();
-
-    bool qualified = false;
-    std::string nspace;
-
-    if (DRE->hasQualifier()) {
-
-#if (LLVM_VERSION_MAJOR > 22) || (LLVM_VERSION_MAJOR == 22 && LLVM_VERSION_MINOR >= 1)
-        auto *NSP = DRE->getQualifier().getAsNamespaceAndPrefix().Namespace->getNamespace();
-#else
-        auto *NSP = DRE->getQualifier()->getAsNamespace();
-#endif
-
-        if (NSP) {
-            NSP = NSP->getCanonicalDecl();
-
-            nspace = NSP->getQualifiedNameAsString();
-            qualified = true;
+    std::string scope;
+    for (const DeclContext *DC = VD->getDeclContext(); DC != nullptr; DC = DC->getParent()) {
+        if (auto *NSD = dyn_cast<NamespaceDecl>(DC)) {
+            std::string ns = NSD->isAnonymousNamespace() ? "anon_" : NSD->getNameAsString();
+            scope = ns + "__" + scope;
         }
     }
 
-    return generate_constant_var_name(varname, qualified, nspace);
+    std::string name = "HILA_device_constant_" + file_tag + scope + VD->getNameAsString();
+
+    // just in case, only identifier characters
+    for (char &c : name)
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+            c = '_';
+
+    return name;
 }
 
 /////////////////////////////////////////////////////////////////////////

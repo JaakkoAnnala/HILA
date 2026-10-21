@@ -244,7 +244,8 @@ struct pragma_types {
 static std::vector<pragma_types> pragma_hila_types{
     {"skip", false},         {"ast_dump", false},        {"loop_function", false},
     {"novector", false},     {"nonvectorizable", false}, {"contains_rng", false},
-    {"direct_access", true}, {"safe_access", true},      {"omp_parallel_region", false}};
+    {"direct_access", true}, {"safe_access", true},      {"omp_parallel_region", false},
+    {"constant_memory", false}};
 
 
 // And grab also #pragma once locations, not allowed in hila code
@@ -859,7 +860,8 @@ class MyASTConsumer : public ASTConsumer {
                         << "******* ERROR: hila source requires hilapp signature >= "
                         << min_signature << ", but hilapp executable has signature "
                         << HILA_SIGNATURE_NUMBER << ".\n "
-                        << "        Recompile hilapp with current code version.\n"
+                        << "        Recompile hilapp with current code version (make -C hilapp install),\n"
+                        << "        or download a prebuilt binary with hilapp/get_hilapp.sh\n"
                         << "This check can be omitted by defining NO_SIGNATURE_CHECK, but it "
                            "may lead to incorrect program.\n";
 

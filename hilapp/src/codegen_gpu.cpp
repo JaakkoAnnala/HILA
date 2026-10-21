@@ -108,6 +108,90 @@ std::string TopLevelVisitor::make_kernel_name() {
            std::to_string(kernel_index++);
 }
 
+/////////////////////////////////////////////////////////////////////////////////////////
+/// Function-local using-directives, using-declarations and namespace aliases which are
+/// visible at the loop.  The kernel is generated outside the function, thus these are
+/// repeated at the beginning of the kernel.  Names are written fully qualified, because
+/// the kernel is not in the scope of the function.
+/////////////////////////////////////////////////////////////////////////////////////////
+
+// qualified name usable in code, or empty if it contains an anonymous namespace
+static std::string usable_qualified_name(const NamedDecl *D) {
+    std::string name = D->getQualifiedNameAsString();
+    if (name.find("(anonymous") != std::string::npos)
+        return "";
+    return "::" + name;
+}
+
+static std::string local_using_string(Decl *D) {
+    std::string name;
+    if (auto *UDD = dyn_cast<UsingDirectiveDecl>(D)) {
+        if (auto *ns = UDD->getNominatedNamespace()) {
+            name = usable_qualified_name(ns);
+            if (!name.empty())
+                return "using namespace " + name + ";\n";
+        }
+    } else if (auto *UD = dyn_cast<UsingDecl>(D)) {
+        if (UD->shadow_size() > 0) {
+            name = usable_qualified_name((*UD->shadow_begin())->getTargetDecl());
+            if (!name.empty())
+                return "using " + name + ";\n";
+        }
+    } else if (auto *NAD = dyn_cast<NamespaceAliasDecl>(D)) {
+        if (auto *ns = NAD->getNamespace()) {
+            name = usable_qualified_name(ns);
+            if (!name.empty())
+                return "namespace " + NAD->getNameAsString() + " = " + name + ";\n";
+        }
+    }
+    return "";
+}
+
+// Walk from statement st towards the loop.  Collect usings in the blocks which contain the loop,
+// located before it
+void TopLevelVisitor::collect_local_usings(Stmt *st, Stmt *loop, SourceLocation loop_loc,
+                                           std::string &out) {
+    for (Stmt *c : st->children()) {
+        if (c == nullptr)
+            continue;
+        if (c == loop)
+            return;
+
+        SourceLocation b = srcMgr.getExpansionLoc(c->getBeginLoc());
+        SourceLocation e = srcMgr.getExpansionLoc(c->getEndLoc());
+
+        if (srcMgr.isBeforeInTranslationUnit(e, loop_loc)) {
+            // before the loop - only declarations directly in an enclosing block are visible
+            if (isa<CompoundStmt>(st)) {
+                if (auto *DS = dyn_cast<DeclStmt>(c)) {
+                    for (Decl *D : DS->decls())
+                        out += local_using_string(D);
+                }
+            }
+        } else if (!srcMgr.isBeforeInTranslationUnit(loop_loc, b)) {
+            // c contains the loop
+            collect_local_usings(c, loop, loop_loc, out);
+            return;
+        } else {
+            // after the loop
+            return;
+        }
+    }
+}
+
+std::string TopLevelVisitor::local_using_declarations(Stmt *S) {
+    std::string out;
+    FunctionDecl *FD = global.currentFunctionDecl;
+    if (FD == nullptr || !FD->hasBody())
+        return out;
+
+    collect_local_usings(FD->getBody(), S, srcMgr.getExpansionLoc(S->getBeginLoc()), out);
+
+    if (!out.empty())
+        out = "// using-declarations of the enclosing function\n" + out;
+    return out;
+}
+
 std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, srcBuf &loopBuf,
                                                bool generate_wait_loops) {
 
@@ -129,6 +213,9 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
 
     code << "auto& compute_stream = hila::compute_stream();\n";
     code << "auto& compute_event = hila::compute_event();\n";
+
+    // deep halo gathers (X + k*dir) are completed before the loop
+    generate_deep_gathers(code);
 
     if (gpu_overlap_comm || gpu_ccl || gpu_shmem) {
         code << "auto& halo_stream = hila::halo_stream();\n";
@@ -304,40 +391,9 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
     kernel << "\n\n//------------------ start kernel " << kernel_name << "--------------------\n";
 
 
-    // Figure out the RNG operation status
-    // For RNG loops we optionally create loop with lower number of active threads
-    // enabling the use of smaller rng generator footprint
-
-    static bool rng_threads_checked = false;
-    static int rng_thread_block_number = 0;
-
+    // thread blocks may be restricted below by GPU_VECTOR_REDUCTION_THREAD_BLOCKS
     bool use_thread_blocks = false;
     int thread_block_number = 0;
-
-    if (loop_info.contains_random) {
-
-        if (!rng_threads_checked) {
-            // now check if the rng thread number is present
-            rng_threads_checked = true;
-            std::string rng_str;
-
-            if (is_macro_defined("GPU_RNG_THREAD_BLOCKS", &rng_str)) {
-                rng_thread_block_number = std::atoi(rng_str.c_str());
-            }
-        }
-
-        if (rng_thread_block_number > 0) {
-            // loop has random and rng thread blocks in use and number known
-            use_thread_blocks = true;
-            thread_block_number = rng_thread_block_number;
-        }
-
-        if (rng_thread_block_number < 0) {
-            reportDiag(DiagnosticsEngine::Level::Warning, loop_info.range.getBegin(),
-                       "loop contains random number generator calls but GPU random numbers are "
-                       "disabled (GPU_RNG_THREAD_BLOCKS < 0).  This may crash the program.");
-        }
-    }
 
 
     // if we have small arrays, encapsulate them in struct
@@ -413,8 +469,6 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
                     loop_has_reductionvector_blocks = true;
                     use_thread_blocks = true;
 
-                    // we have to take smaller of block numbers - RNG works with smaller number,
-                    // but not larger.
                     if (thread_block_number > 0) {
                         thread_block_number = std::min(thread_block_number, blocks);
                     } else {
@@ -540,7 +594,22 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
 
 
     kernel_launch =
-        kernel_name + "<<< N_blocks, N_threads,0, compute_stream>>>( _hila_loop_begin, _hila_loop_end";
+        kernel_name +
+        "<<< N_blocks, N_threads,0, compute_stream>>>( _hila_loop_begin, _hila_loop_end";
+
+    if (loop_info.contains_random) {
+        // add philox_loop_counter
+        kernel << ", uint32_t HILA_philox_loop_counter";
+        kernel_launch += ", hila_philox_loop_counter";
+    }
+
+    // without EVEN_SITES_FIRST parity loops go through all sites, pass the parity to the kernel
+    bool parity_check =
+        !is_macro_defined("EVEN_SITES_FIRST") && loop_info.parity_value != Parity::all;
+    if (parity_check) {
+        kernel << ", const unsigned HILA_parity_bits_";
+        kernel_launch += ", static_cast<unsigned>(" + loop_info.parity_str + ")";
+    }
 
     // print field call list
     int i = 0;
@@ -628,7 +697,7 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
         std::string repl_string;
         repl_string = "{\n " + s.maskname + looping + " = 1;\n";
         repl_string +=
-            s.sitename + looping + " = SiteIndex(_dev_coordinates[" + looping_var + "]);\n";
+            s.sitename + looping + " = SiteIndex(get_dev_coordinates(" + looping_var + "));\n";
 
         if (s.assign_expr == nullptr) {
 
@@ -809,6 +878,9 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
     // Begin the function
     kernel << ")\n{\n";
 
+    // function-local using-declarations which are visible at the loop
+    kernel << local_using_declarations(S);
+
     // kernel << "backend_lattice_struct *hila_loop_lattice = &d_lattice; \n";
 
     // Declare the shared reduction variable inside loop
@@ -834,6 +906,13 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
         }
     }
 
+    /////////////////////////////////////////////////////////////////////////////
+    // First, reset philox loop counter
+
+    if (loop_info.contains_random) {
+        kernel << "// philox_setup_loopcount calls __syncthreads(); must be called by all threads\n";
+        kernel << "hila::philox_setup_loopcount(HILA_philox_loop_counter);\n";
+    }
 
     /////////////////////////////////////////////////////////////////////////////
     // Standard boilerplate in CUDA kernels: calculate site index
@@ -856,6 +935,43 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
                << looping_var << " = HILA_idx_l_;\n";
     }
 
+    if (loop_info.contains_random) {
+        // initialize philox - NOTE: contains __syncthreads(), so ALL THREADS MUST EXECUTE THIS!
+        kernel << "hila::philox_setup_index(SiteIndex(get_dev_coordinates(" + looping_var +
+                      ")).value);\n";
+    }
+
+    // With LAYOUT_ON_THE_FLY neighbour indices are computed from the site coordinates,
+    // which are computed once per site
+    bool layout_on_the_fly = is_macro_defined("LAYOUT_ON_THE_FLY");
+    bool any_read_nb = false;
+    for (field_info &l : field_info_list)
+        if (l.is_read_nb)
+            any_read_nb = true;
+
+    if ((layout_on_the_fly && (any_read_nb || parity_check)) || has_deep_refs())
+        kernel << "const hila::layout_site HILA_site_ = hila_dev_site(" << looping_var << ");\n";
+
+    if (parity_check) {
+        // Parity value: even = 1, odd = 2, all = 3, site parity 0 or 1
+        kernel << "if ((HILA_parity_bits_ >> HILA_site_.parity) & 1) {\n";
+    }
+
+    // index of deep halo ref X + k*dir
+    auto deep_index = [&](const dir_ptr &d) -> std::string {
+        return "hila_dev_neighbour_offset(HILA_site_, " + deep_dir_string(d, loopBuf, true) +
+               ", " + std::to_string(d.deep_k) + ")";
+    };
+
+    // expression for the index of the neighbour of fieldname to direction dirname
+    auto nb_index = [&](const std::string &fieldname, const std::string &dirname) -> std::string {
+        if (layout_on_the_fly)
+            return "hila_dev_neighbour(" + fieldname + ".neighbours[" + dirname +
+                   "], HILA_site_, " + looping_var + ", " + dirname + ")";
+        else
+            return fieldname + ".neighbours[" + dirname + "][" + looping_var + "]";
+    };
+
     // Create temporary field element variables
     for (field_info &l : field_info_list) {
         if (l.is_read_nb) {
@@ -863,6 +979,15 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             if (!l.is_loop_local_dir) {
                 // "standard" loop extern neighb direction
                 for (dir_ptr &d : l.dir_list) {
+                    if (d.deep_k > 0) {
+                        kernel << "const " << l.element_type << " " << d.name_with_dir << " = "
+                               << l.new_name << ".get(" << deep_index(d)
+                               << ", _dev_field_alloc_size);\n";
+                        for (field_ref *ref : d.ref_list)
+                            loopBuf.replace(ref->fullExpr, d.name_with_dir);
+                        continue;
+                    }
+
                     std::string dirname;
                     if (d.is_constant_direction)
                         dirname = d.direxpr_s; // orig. string
@@ -879,8 +1004,8 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
 
                     // Create the temp variable and call the getter
                     kernel << "const " << l.element_type << " " << d.name_with_dir << " = "
-                           << l.new_name << ".get(" << l.new_name << ".neighbours[" << dirname
-                           << "][" << looping_var << "], _dev_field_alloc_size);\n";
+                           << l.new_name << ".get(" << nb_index(l.new_name, dirname)
+                           << ", _dev_field_alloc_size);\n";
 
                     // and replace references in loop body
                     for (field_ref *ref : d.ref_list) {
@@ -902,12 +1027,17 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
                 kernel << l.element_type << ' ' << loop_array_name << "[NDIRS];\n";
                 kernel << "for (int HILA_dir_ = 0; HILA_dir_ < NDIRS; "
                           "++HILA_dir_) {\n"
-                       << loop_array_name << "[HILA_dir_] = " << l.new_name << ".get(" << l.new_name
-                       << ".neighbours[HILA_dir_][" << looping_var
-                       << "], _dev_field_alloc_size);\n}\n";
+                       << loop_array_name << "[HILA_dir_] = " << l.new_name << ".get("
+                       << nb_index(l.new_name, "HILA_dir_") << ", _dev_field_alloc_size);\n}\n";
 
                 // and replace references in loop body
                 for (dir_ptr &d : l.dir_list) {
+                    if (d.deep_k > 0) {
+                        for (field_ref *ref : d.ref_list)
+                            loopBuf.replace(ref->fullExpr, l.new_name + ".get(" + deep_index(d) +
+                                                               ", _dev_field_alloc_size)");
+                        continue;
+                    }
                     std::string dirname;
                     if (d.is_constant_direction)
                         dirname = d.direxpr_s; // orig. string
@@ -924,6 +1054,12 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
 
                 // and variable direction refs - use accessor directly
                 for (dir_ptr &d : l.dir_list) {
+                    if (d.deep_k > 0) {
+                        for (field_ref *ref : d.ref_list)
+                            loopBuf.replace(ref->fullExpr, l.new_name + ".get(" + deep_index(d) +
+                                                               ", _dev_field_alloc_size)");
+                        continue;
+                    }
                     std::string dirname;
                     if (d.is_constant_direction)
                         dirname = d.direxpr_s; // orig. string
@@ -932,10 +1068,9 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
                             loopBuf.get(d.parityExpr->getSourceRange())); // mapped name was
 
                     for (field_ref *ref : d.ref_list) {
-                        loopBuf.replace(ref->fullExpr, l.new_name + ".get(" + l.new_name +
-                                                           ".neighbours[" + dirname + "][" +
-                                                           looping_var +
-                                                           "], _dev_field_alloc_size)");
+                        loopBuf.replace(ref->fullExpr, l.new_name + ".get(" +
+                                                           nb_index(l.new_name, dirname) +
+                                                           ", _dev_field_alloc_size)");
                     }
                 }
 #endif
@@ -1024,6 +1159,10 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
             kernel << l.new_name << ".set(" << l.loop_ref_name << ", " << looping_var
                    << ", _dev_field_alloc_size );\n";
         }
+
+    // end the parity check
+    if (parity_check)
+        kernel << "}\n";
 
     // end the if ( looping_var < d_lattice.loop_end) or for() {
     kernel << "}\n";

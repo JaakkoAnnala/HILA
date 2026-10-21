@@ -40,6 +40,93 @@ bool report_pass(std::string message, double eps, double limit) {
     }
 }
 
+//////////////////////////////////////////////////////////////////////////////////////
+// hila::global variables in namespaces, used in onsites() and loop functions
+
+namespace hc_globals {
+hila::global<double> a;
+
+// unqualified reference inside the namespace
+#pragma hila loop_function
+inline double times_a(double x) {
+    return x * a();
+}
+
+namespace inner {
+hila::global<double> b;
+}
+
+// partially qualified reference
+#pragma hila loop_function
+inline double get_b() {
+    return inner::b();
+}
+} // namespace hc_globals
+
+namespace {
+hila::global<double> hc_anon_global;
+}
+
+hila::global<double> hc_top_global;
+
+/**
+ * @brief Test hila::global variables in namespaces
+ * @details On GPUs globals are __constant__ device variables, whose names hilapp
+ * generates from the namespaces of the declaration
+ */
+void test_globals() {
+
+    // function-local using-directive, hilapp copies it to GPU kernels
+    using namespace hc_globals;
+
+    hc_globals::a = 1;
+    hc_globals::inner::b = 10;
+    hc_anon_global = 100;
+    hc_top_global = 1000;
+
+    Field<double> f;
+    onsites (ALL) {
+        f[X] = hc_globals::a() + times_a(1.0) + hc_globals::inner::b() + get_b() +
+               hc_anon_global() + a() + hc_top_global();
+    }
+    // 1 + 1 + 10 + 10 + 100 + 1 + 1000
+    report_pass("hila::global in namespaces", f.sum() / lattice.volume() - 1123, 1e-12);
+}
+
+//////////////////////////////////////////////////////////////////////////////////////
+// Field of a hila type (template class with base_type and argument_type) declared in a
+// namespace: hilapp generates specializations of Field methods for it, which must be
+// placed outside the namespace
+
+namespace hc_types {
+template <typename T>
+struct pt {
+    using base_type = hila::arithmetic_type<T>;
+    using argument_type = T;
+    T x;
+};
+
+// Field<pt<double>> used inside the namespace, after the type
+inline double neighbour_product_sum() {
+    Field<pt<double>> p;
+    onsites (ALL) p[X].x = X.x();
+    double s = 0;
+    onsites (ALL) s += p[X + e_x].x * p[X].x;
+    return s;
+}
+} // namespace hc_types
+
+void test_namespace_field_type() {
+    // sum over x of x * ((x+1) mod L), times the number of x-rows
+    int L = lattice.size(e_x);
+    double expect = 0;
+    for (int x = 0; x < L; x++)
+        expect += x * ((x + 1) % L);
+    expect *= lattice.volume() / L;
+    report_pass("Field of a hila type in a namespace",
+                (hc_types::neighbour_product_sum() - expect) / expect, 1e-12);
+}
+
 /**
  * @brief Test various functions on fields.
  * @details Test functions exp (on both real and complex field) and sin.
@@ -704,6 +791,143 @@ void test_fft() {
 }
 
 /**
+ * @brief Test real Fourier transform FFT_real
+ * @details Compare with the complex FFT: element values to one direction, binned power
+ * and cross spectra, Parseval, inverse transform, float and multi-component fields.
+ */
+void test_fft_real() {
+
+    // relative difference of two binned spectra
+    auto rel_diff = [](const std::vector<double> &a, const std::vector<double> &b) {
+        double d = 0, n = 0;
+        for (int i = 0; i < a.size(); i++) {
+            d += fabs(a[i] - b[i]);
+            n += fabs(b[i]);
+        }
+        return hila::broadcast(d / n);
+    };
+
+    Field<double> r, g;
+    onsites (ALL) {
+        r[X] = hila::gaussrand();
+        g[X] = 0.5 * r[X] + hila::gaussrand();
+    }
+    double rnorm = r.squarenorm();
+
+    // transform to one direction at a time, compare elementwise with the complex transform:
+    // h(k) = sqrt(2) Re F(k) for 0 < k < L/2,  h(L-k) = sqrt(2) Im F(k) = -sqrt(2) Im F(L-k)
+    foralldir (d) {
+        CoordinateVector dirs;
+        dirs.fill(false);
+        dirs[d] = true;
+
+        Field<Complex<double>> F;
+        onsites (ALL)
+            F[X] = Complex<double>(r[X], 0);
+        F = F.FFT(dirs);
+
+        Field<double> h = r.FFT_real(dirs);
+        int L = lattice.size(d);
+        double eps = 0;
+        onsites (ALL) {
+            int k = X.coordinate(d);
+            double expect;
+            if (k == 0 || 2 * k == L)
+                expect = F[X].real();
+            else if (2 * k < L)
+                expect = M_SQRT2 * F[X].real();
+            else
+                expect = -M_SQRT2 * F[X].imag();
+            eps += squarenorm(h[X] - expect);
+        }
+        report_pass("FFT_real to direction " + hila::prettyprint(d) + " vs. complex FFT",
+                    eps / rnorm, 1e-26 * L);
+    }
+
+    Field<double> hr = r.FFT_real();
+    Field<double> hg = g.FFT_real();
+
+    {
+        // all directions at once vs. one direction at a time
+        Field<double> hs = r;
+        foralldir (d) {
+            CoordinateVector dirs;
+            dirs.fill(false);
+            dirs[d] = true;
+            hs = hs.FFT_real(dirs);
+        }
+        report_pass("FFT_real all directions vs. one at a time",
+                    squarenorm_relative(hr, hs) / hr.squarenorm(), 1e-26);
+    }
+
+    // Parseval
+    report_pass("FFT_real Parseval", fabs(hr.squarenorm() / lattice.volume() - rnorm) / rnorm,
+                1e-12);
+
+    // inverse
+    Field<double> r2 = hr.FFT_real(fft_direction::back) / lattice.volume();
+    report_pass("FFT_real inverse transform", squarenorm_relative(r, r2) / rnorm, 1e-26);
+
+    // binned power and cross spectra vs complex FFT
+    {
+        auto Fr = r.FFT_real_to_complex();
+        auto Fg = g.FFT_real_to_complex();
+
+        hila::k_binning b;
+        b.k_max(M_PI * sqrt(1.0 * NDIM));
+
+        report_pass("FFT_real binned power spectrum",
+                    rel_diff(b.bin_k_field_squarenorm(hr), b.bin_k_field_squarenorm(Fr)), 1e-12);
+
+        Field<double> prod_real = hr * hg;
+        Field<double> prod_cmplx;
+        onsites (ALL)
+            prod_cmplx[X] = (Fr[X].conj() * Fg[X]).real();
+
+        report_pass("FFT_real binned cross spectrum",
+                    rel_diff(b.bin_k_field(prod_real), b.bin_k_field(prod_cmplx)), 1e-12);
+
+        // spectraldensity() uses FFT_real for real fields
+        Field<Complex<double>> rc;
+        onsites (ALL)
+            rc[X] = Complex<double>(r[X], 0);
+        report_pass("spectraldensity of real field",
+                    rel_diff(b.spectraldensity(r), b.spectraldensity(rc)), 1e-12);
+    }
+
+    // multi-component field: each component transformed separately
+    {
+        Field<Vector<2, double>> v;
+        onsites (ALL) {
+            v[X].e(0) = r[X];
+            v[X].e(1) = g[X];
+        }
+        auto hv = v.FFT_real();
+        double eps = 0;
+        onsites (ALL) {
+            eps += squarenorm(hv[X].e(0) - hr[X]) + squarenorm(hv[X].e(1) - hg[X]);
+        }
+        report_pass("FFT_real Vector<2,double>", eps / hr.squarenorm(), 1e-26);
+    }
+
+    // float
+    {
+        Field<float> rf;
+        onsites (ALL)
+            rf[X] = r[X];
+        Field<float> hf = rf.FFT_real();
+        double eps = 0;
+        onsites (ALL)
+            eps += squarenorm(hf[X] - hr[X]);
+        report_pass("FFT_real float vs double", eps / hr.squarenorm(), 1e-11);
+
+        Field<float> rf2 = hf.FFT_real(fft_direction::back) / lattice.volume();
+        report_pass("FFT_real float inverse", squarenorm_relative(rf, rf2) / rnorm, 1e-11);
+    }
+
+}
+
+/**
  * @brief Test spectral density
  * @details Test spectral density extraction from field.
  *
@@ -769,6 +993,77 @@ void test_spectraldensity() {
 
         report_pass("Spectral density test with above vector ", sum, 1e-10);
     }
+}
+
+/**
+ * @brief Test cross spectrum
+ * @details Compare k_binning::cross_spectrum with Re(F^* G) binned from complex FFTs,
+ * for real, complex and Vector fields
+ */
+void test_cross_spectrum() {
+
+    auto rel_diff = [](const std::vector<double> &a, const std::vector<double> &b) {
+        double d = 0, n = 0;
+        for (int i = 0; i < a.size(); i++) {
+            d += fabs(a[i] - b[i]);
+            n += fabs(b[i]);
+        }
+        return hila::broadcast(d / n);
+    };
+
+    hila::k_binning b;
+    b.k_max(M_PI * sqrt(1.0 * NDIM));
+
+    // real fields, correlated
+    Field<double> r, s;
+    onsites (ALL) {
+        r[X] = hila::gaussrand();
+        s[X] = 0.5 * r[X] + hila::gaussrand();
+    }
+
+    // reference: Re(F^* G) from complex FFTs
+    auto Fr = r.FFT_real_to_complex();
+    auto Fs = s.FFT_real_to_complex();
+    Field<double> ref;
+    onsites (ALL)
+        ref[X] = (Fr[X].conj() * Fs[X]).real();
+
+    report_pass("cross_spectrum of real fields",
+                rel_diff(b.cross_spectrum(r, s), b.bin_k_field(ref)), 1e-12);
+
+    report_pass("cross_spectrum(f,f) == spectraldensity(f)",
+                rel_diff(b.cross_spectrum(r, r), b.spectraldensity(r)), 1e-12);
+
+    // complex fields
+    Field<Complex<double>> cr, cs;
+    onsites (ALL) {
+        cr[X] = Complex<double>(hila::gaussrand(), hila::gaussrand());
+        cs[X] = 0.5 * cr[X] + Complex<double>(hila::gaussrand(), hila::gaussrand());
+    }
+    auto Fcr = cr.FFT();
+    auto Fcs = cs.FFT();
+    onsites (ALL)
+        ref[X] = (Fcr[X].conj() * Fcs[X]).real();
+
+    report_pass("cross_spectrum of complex fields",
+                rel_diff(b.cross_spectrum(cr, cs), b.bin_k_field(ref)), 1e-12);
+
+    // Vector field: sum over components
+    Field<Vector<2, double>> v, w;
+    onsites (ALL) {
+        v[X].e(0) = r[X];
+        v[X].e(1) = s[X];
+        w[X].e(0) = s[X];
+        w[X].e(1) = 2 * r[X];
+    }
+    auto c_vw = b.cross_spectrum(v, w);
+    auto c_rs = b.cross_spectrum(r, s);
+    auto c_sr = b.cross_spectrum(s, r);
+    std::vector<double> c_sum(c_rs.size());
+    for (int i = 0; i < c_sum.size(); i++)
+        c_sum[i] = c_rs[i] + 2 * c_sr[i];
+
+    report_pass("cross_spectrum of Vector<2,double> fields", rel_diff(c_vw, c_sum), 1e-12);
 }
 
 //--------------------------------------------------------------------------------
@@ -970,6 +1265,13 @@ void test_extended() {
 
 void test_clusters() {
 
+    foralldir (d) {
+        if (lattice.size(d) == 1) {
+            hila::out0 << " ...  Skipping cluster test because lattice extent is 1\n";
+            return;
+        }
+    }
+
     {
 #if NDIM > 2 && !defined(VECTORIZED)
 
@@ -1072,6 +1374,64 @@ void test_clusters() {
 }
 //--------------------------------------------------------------------------------
 
+/**
+ * @brief Test k_binning on an anisotropically blocked lattice
+ * @details Field cos(2 pi n x_d / L_d) g(x_perp), blocked by 2 to direction d, has the same
+ * Fourier modes as the unblocked one.  Binned spectra must agree if k is scaled to base
+ * lattice units and the spectrum by (blocking volume)^2.
+ */
+void test_spectraldensity_blocking() {
+
+    Direction db = NDIRECTIONS;
+    foralldir (d) {
+        if (db == NDIRECTIONS && lattice.size(d) % 2 == 0 && lattice.size(d) >= 8)
+            db = d;
+    }
+    if (db == NDIRECTIONS || !lattice.is_base())
+        return;
+
+    CoordinateVector blocking;
+    blocking.fill(1);
+    blocking[db] = 2;
+
+    hila::print_dashed_line();
+    hila::out0 << "Testing spectraldensity on lattice blocked by " << blocking << '\n';
+
+    const int n = 3;
+    const int L = lattice.size(db);
+    Field<double> f, fb;
+    onsites (ALL) {
+        double g = 1;
+        foralldir (d) {
+            if (d != db) {
+                int x = X.coordinate(d);
+                g *= 1.0 + sin(0.7 * x * x + 1.3 * (d + 1) * x);
+            }
+        }
+        f[X] = cos(2 * M_PI * n * X.coordinate(db) / L) * g;
+    }
+
+    hila::k_binning b;
+    auto sd = b.spectraldensity(f);
+
+    lattice.block(blocking);
+    fb.block_from(f);
+    auto sdb = b.spectraldensity(fb);
+    auto csb = b.cross_spectrum(fb, fb);
+    lattice.unblock();
+
+    double diff = 0, cdiff = 0, norm = 0;
+    for (int i = 0; i < sd.size(); i++) {
+        diff += fabs(sd[i] - sdb[i]);
+        cdiff += fabs(sd[i] - csb[i]);
+        norm += fabs(sd[i]);
+    }
+    report_pass("Spectral density, anisotropic blocking", hila::broadcast(diff / norm), 1e-10);
+    report_pass("Cross spectrum, anisotropic blocking", hila::broadcast(cdiff / norm), 1e-10);
+}
+
+//--------------------------------------------------------------------------------
+
 void test_blocking() {
 
     CoordinateVector blocking;
@@ -1112,6 +1472,7 @@ void test_blocking() {
         test_site_access();
         test_set_elements_and_select();
         test_fft();
+        test_fft_real();
 
         lattice.unblock();
         cvfb.unblock_to(cvf);
@@ -1162,6 +1523,8 @@ int main(int argc, char **argv) {
     // start tests
 
     test_reductions();
+    test_globals();
+    test_namespace_field_type();
     test_functions();
     test_site_access();
     test_minmax();
@@ -1172,11 +1535,14 @@ int main(int argc, char **argv) {
     test_matrix_operations();
     test_element_operations();
     test_fft();
+    test_fft_real();
     test_spectraldensity();
+    test_cross_spectrum();
     test_matrix_algebra();
     test_extended();
     test_clusters();
     test_blocking();
+    test_spectraldensity_blocking();
 
     hila::finishrun();
 }

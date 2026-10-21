@@ -1,0 +1,170 @@
+name: Build prebuilt hilapp binaries
+
+# Builds statically linked hilapp binaries for x86_64 and aarch64 Linux and uploads them
+# to a single rolling GitHub release (tag hilapp-binaries).  Users install them with
+# hilapp/get_hilapp.sh.
+#
+# Each hilapp source version is identified by  hilapp-s<signature>-<tree>  where <signature>
+# is HILA_SIGNATURE_NUMBER in libraries/hila_signatures.h and <tree> is the git tree hash of
+# the hilapp/ directory (git rev-parse --short=12 HEAD:hilapp).  Release assets:
+#   hilapp-s<sig>-<tree>-linux-<arch>.tar.gz (+ .sha256)  binary for exactly this source
+#   hilapp-s<sig>-latest.txt                              newest version with signature <sig>
+# Only the newest KEEP_VERSIONS versions are kept.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'hilapp/**'
+      - 'libraries/hila_signatures.h'
+      - '.github/workflows/hilapp-binaries.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hilapp-binaries
+  cancel-in-progress: false
+
+env:
+  LLVM_VERSION: 18
+  RELEASE_TAG: hilapp-binaries
+  KEEP_VERSIONS: 30
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sig: ${{ steps.version.outputs.sig }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/Clang development packages and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-${LLVM_VERSION}-dev libclang-${LLVM_VERSION}-dev clang-${LLVM_VERSION} libpolly-${LLVM_VERSION}-dev \
+            zlib1g-dev libzstd-dev libxml2-dev libncurses-dev \
+            g++ make libopenmpi-dev openmpi-bin libfftw3-dev
+
+      - name: Source version
+        id: version
+        run: |
+          sig=$(awk '/^#define HILA_SIGNATURE_NUMBER/ {print $3}' libraries/hila_signatures.h)
+          tree=$(git rev-parse --short=12 HEAD:hilapp)
+          echo "sig=${sig}" >> "$GITHUB_OUTPUT"
+          echo "version=hilapp-s${sig}-${tree}" >> "$GITHUB_OUTPUT"
+          echo "Version hilapp-s${sig}-${tree}"
+
+      - name: Build statically linked hilapp
+        run: |
+          # on failure, show the error lines as annotations on the run summary page
+          if ! make -C hilapp -j4 static LLVM_VERSION=${LLVM_VERSION} > build.log 2>&1; then
+            cat build.log
+            grep -E -i 'error|undefined|cannot find|not found' build.log | head -20 | sed 's/^/::error::/'
+            exit 1
+          fi
+          tail -5 build.log
+          strip hilapp/build/hilapp
+          file hilapp/build/hilapp
+          mkdir -p hilapp/bin
+          cp hilapp/build/hilapp hilapp/bin/hilapp
+
+      - name: Test - build and run hila_healthcheck with the binary
+        run: |
+          cd applications/hila_healthcheck
+          # vanilla target uses -mavx2, override for portability (and aarch64)
+          if ! make -j4 CXXFLAGS="-x c++ --std=c++17 -fno-rtti -O2" > build.log 2>&1; then
+            cat build.log
+            grep -E -i 'error|undefined' build.log | head -20 | sed 's/^/::error::/'
+            exit 1
+          fi
+          mpirun --oversubscribe -np 2 ./build/hila_healthcheck -p "lattice size" "32,32,32" > out.txt 2>&1
+          passed=$(grep -ci passed out.txt || true)
+          failed=$(grep -ci failed out.txt || true)
+          echo "healthcheck: ${passed} passed, ${failed} failed"
+          if [ "${failed}" != "0" ] || [ "${passed}" -lt 50 ]; then
+            cat out.txt
+            grep -i -E 'failed|error' out.txt | head -20 | sed 's/^/::error::/'
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p pkg
+          cp hilapp/build/hilapp pkg/
+          {
+            echo "version: ${{ steps.version.outputs.version }}"
+            echo "commit: ${GITHUB_SHA}"
+            echo "arch: ${{ matrix.arch }}"
+            echo "llvm: $(llvm-config-${LLVM_VERSION} --version)"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > pkg/BUILD_INFO
+          name=${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz
+          tar -C pkg -czf ${name} hilapp BUILD_INFO
+          sha256sum ${name} > ${name}.sha256
+          cat ${name}.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hilapp-${{ matrix.arch }}
+          path: |
+            hilapp-s*-linux-${{ matrix.arch }}.tar.gz
+            hilapp-s*-linux-${{ matrix.arch }}.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SIG: ${{ needs.build.outputs.sig }}
+        run: |
+          echo "${VERSION}" > "dist/hilapp-s${SIG}-latest.txt"
+          ls -l dist
+          if ! gh release view "${RELEASE_TAG}" > /dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" --target "${GITHUB_SHA}" --latest=false \
+              --title "Prebuilt hilapp binaries" \
+              --notes "Statically linked hilapp for Linux x86_64 and aarch64, updated automatically for each hilapp change on the main branch.  Install with hilapp/get_hilapp.sh, which picks the binary matching the checked-out source."
+          fi
+          # binaries first, then the latest pointer
+          gh release upload "${RELEASE_TAG}" dist/*.tar.gz dist/*.sha256 --clobber
+          gh release upload "${RELEASE_TAG}" "dist/hilapp-s${SIG}-latest.txt" --clobber
+
+      - name: Remove old versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          id=$(gh api "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" --jq .id)
+          gh api --paginate "repos/${GH_REPO}/releases/${id}/assets?per_page=100" \
+            --jq '.[] | select(.name | test("^hilapp-s[0-9]+-[0-9a-f]+-linux-x86_64\\.tar\\.gz$")) | "\(.created_at) \(.name)"' |
+            sort -r | tail -n +$((KEEP_VERSIONS + 1)) | while read -r _ name; do
+              v=${name%-linux-x86_64.tar.gz}
+              echo "Removing ${v}"
+              for a in x86_64 aarch64; do
+                for f in "${v}-linux-${a}.tar.gz" "${v}-linux-${a}.tar.gz.sha256"; do
+                  gh release delete-asset "${RELEASE_TAG}" "${f}" --yes || true
+                done
+              done
+            done

@@ -159,9 +159,8 @@ void TopLevelVisitor::generate_code(Stmt *S) {
     std::stringstream code;
     code << "{\n";
 
-    if (loop_info.contains_random) {
+    if (loop_info.contains_random)
         code << "hila::check_that_rng_is_initialized();\n";
-    }
 
     generate_parity_code(code, parity_var_name);
     generate_selection_code(code);
@@ -198,6 +197,9 @@ void TopLevelVisitor::generate_code(Stmt *S) {
     handle_reduction_result(code);
 
     mark_fields_changed(code);
+
+    if (loop_info.contains_random)
+        code << "hila::philox_after_onsites();   // reset philox to host\n";
 
     // and close
     code << "}\n//----------\n";

@@ -1,6 +1,7 @@
 #include "stringops.h"
 #include "hilapp.h"
 #include "toplevelvisitor.h"
+#include "clang/AST/QualTypeNames.h"
 
 #include "idx_expr_evaluator.h"
 
@@ -221,6 +222,25 @@ bool TopLevelVisitor::handle_field_X_expr(Expr *e, bool &is_assign, bool is_also
                            "non-nearest neighbour reference cannot depend on variable "
                            "'%0' defined inside site loop",
                            frc.getLocalVarInfo()->name.c_str());
+            } else if (halo_depth() > 1 && !is_assign) {
+                // Is it an axis offset X + k*dir which can be read from the deep halo?
+                Expr *dirE;
+                int k;
+                std::vector<Expr *> atoms;
+                if (parse_axis_offset(lfe.parityExpr, dirE, k, atoms) && std::abs(k) >= 2 &&
+                    std::abs(k) <= halo_depth()) {
+
+                    lfe.is_offset = false;
+                    lfe.deep_k = std::abs(k);
+                    lfe.deep_dirExpr = dirE;
+                    lfe.deep_negate = (k < 0);
+
+                    // register the variables in the direction expression(s), these are
+                    // needed in the loop
+                    is_assign = false;
+                    for (Expr *a : atoms)
+                        TraverseStmt(a);
+                }
             }
 
         } else {
@@ -1717,14 +1737,16 @@ bool TopLevelVisitor::check_field_ref_list() {
             // TODO: use better method?
             bool found = false;
             for (dir_ptr &dp : fip->dir_list) {
-                if (p.is_constant_direction) {
+                if (dp.deep_k != p.deep_k) {
+                    found = false; // deep halo refs only with equal depth
+                } else if (p.is_constant_direction) {
                     found = (dp.is_constant_direction && dp.constant_value == p.constant_value);
                 } else {
                     found = is_duplicate_expr(dp.parityExpr, p.parityExpr);
                 }
 
                 if (found) {
-                    dp.count += (p.is_offset == false); // only nn in count
+                    dp.count += (p.is_offset == false && p.deep_k == 0); // only nn in count
                     dp.ref_list.push_back(&p);
                     break;
                 }
@@ -1733,8 +1755,11 @@ bool TopLevelVisitor::check_field_ref_list() {
             if (!found) {
                 dir_ptr dp;
                 dp.parityExpr = p.parityExpr;
-                dp.count = (p.is_offset == false);
+                dp.count = (p.is_offset == false && p.deep_k == 0);
                 dp.is_offset = p.is_offset;
+                dp.deep_k = p.deep_k;
+                dp.deep_dirExpr = p.deep_dirExpr;
+                dp.deep_negate = p.deep_negate;
                 dp.is_constant_direction = p.is_constant_direction;
                 dp.constant_value = p.constant_value;
                 dp.is_loop_local_dir = p.is_loop_local_dir;
@@ -1746,6 +1771,24 @@ bool TopLevelVisitor::check_field_ref_list() {
             }
         } // Direction
     } // p-loop
+
+    // Deep halo refs cannot be used if the field is written in the loop (the halo would
+    // be read while the field changes).  Use the shift-copy method for these.
+    for (field_info &l : field_info_list) {
+        if (l.is_written) {
+            for (dir_ptr &dp : l.dir_list) {
+                if (dp.deep_k > 0) {
+                    dp.deep_k = 0;
+                    dp.is_offset = true;
+                    for (field_ref *r : dp.ref_list) {
+                        r->deep_k = 0;
+                        r->is_offset = true;
+                    }
+                    l.is_read_offset = true;
+                }
+            }
+        }
+    }
 
     for (field_info &l : field_info_list) {
 
@@ -2741,7 +2784,13 @@ void TopLevelVisitor::specialize_function_or_method(FunctionDecl *f) {
             funcBuf.insert(0, " auto ", true, true);
         } else {
             // Normal case, just add the declared return type.
-            funcBuf.insert(0, f->getDeclaredReturnType().getAsString(PP) + " ", true, true);
+            // fully qualified: the specialization may be outside the namespace where the
+            // type names are visible
+            funcBuf.insert(0,
+                           TypeName::getFullyQualifiedName(f->getDeclaredReturnType(), *Context,
+                                                           PP) +
+                               " ",
+                           true, true);
         }
     }
 
@@ -2762,9 +2811,16 @@ void TopLevelVisitor::specialize_function_or_method(FunctionDecl *f) {
     // Insertion point for the specialization:  it seems that the template
     // specialization "source" is the 1st declaration.  We want to go after
 
-    SourceLocation insertion_point = spec_insertion_point(typeargs, global.location.bot, f);
+    // pre and post close and reopen namespaces, if the insertion point is within a namespace
+    std::string spec_pre, spec_post;
+    SourceLocation insertion_point =
+        spec_insertion_point(spec_pre, spec_post, typeargs, global.location.bot, f);
 
     SourceRange decl_sr = get_func_decl_range(f);
+
+    // inserted before the kernels generated below - inserts at the same location are appended
+    if (!spec_pre.empty())
+        get_file_srcBuf(insertion_point)->insert(insertion_point, spec_pre, false, false);
 
     // Now we should write the spec here
 
@@ -2780,7 +2836,7 @@ void TopLevelVisitor::specialize_function_or_method(FunctionDecl *f) {
     // insert after the current toplevedecl
     std::stringstream sb;
     sb << "\n\n// ++++++++ hilapp generated function/method specialization\n"
-       << funcBuf.dump() << "\n// ++++++++\n\n";
+       << funcBuf.dump() << "\n// ++++++++\n\n" << spec_post;
 
     // buffer is not necessarily in toplevelBuf, so:
 
@@ -2911,30 +2967,53 @@ bool TopLevelVisitor::handle_global_var_decl(Decl *D) {
                 SourceRange sr = D->getSourceRange();
                 sr = get_real_range(sr); // if there are macros...
 
-                auto dev_varname =
-                    generate_constant_var_name(VD->getQualifiedNameAsString(), false, "");
+                auto dev_varname = generate_constant_var_name(VD);
 
                 std::stringstream cdecl, vardecl;
                 cdecl << "\n// ===================== hilapp: global variable "
                       << VD->getQualifiedNameAsString() << '\n';
                 cdecl << "// create unique type for specialization\n";
 
-                auto customtype = "TYPE" + dev_varname;
+                auto customtype = "TYPE_" + dev_varname;
 
                 // create unique typedef
                 cdecl << "struct " << customtype << " {};\n";
 
-                cdecl << "__constant__ ";
+                // Device memory of the variable: __constant__ if marked with
+                // #pragma hila constant_memory (system globals, all defined in hila_gpu.cpp), or
+                // if GPU_GLOBALS_IN_CONSTANT_MEMORY is defined.  Otherwise __device__: the device
+                // linker does not always lay out __constant__ variables of several files correctly
+                static int globals_in_constant = -1;
+                if (globals_in_constant < 0)
+                    globals_in_constant = is_macro_defined("GPU_GLOBALS_IN_CONSTANT_MEMORY");
+                // the pragma is on the line before the declaration; the declaration may begin
+                // with a macro expanding to nothing (e.g. HILA_GPU_EXTERN), so look from the
+                // first non-blank character of the line
+                SourceLocation line_start = srcMgr.getExpansionLoc(D->getBeginLoc());
+                while (line_start.isValid() &&
+                       srcMgr.getFileOffset(line_start) > 0 &&
+                       getChar(line_start.getLocWithOffset(-1)) != '\n')
+                    line_start = line_start.getLocWithOffset(-1);
+                while (line_start.isValid() && std::isspace(getChar(line_start)) &&
+                       getChar(line_start) != '\n')
+                    line_start = line_start.getLocWithOffset(1);
+
+                if (globals_in_constant || has_pragma(line_start, pragma_hila::CONSTANT_MEMORY))
+                    cdecl << "__constant__ ";
+                else
+                    cdecl << "__device__ ";
 
                 vardecl << "\n// custom global declaration\n";
 
+                // The device var is never static: static __constant__ does not work with
+                // relocatable device code.  For non-visible globals the name is unique to
+                // the file instead, see generate_constant_var_name()
                 auto storageclass = VD->getStorageClass();
                 if (storageclass == StorageClass::SC_Extern) {
                     cdecl << "extern ";
                     vardecl << "extern ";
                 }
                 if (storageclass == StorageClass::SC_Static) {
-                    cdecl << "static ";
                     vardecl << "static ";
                 }
 
@@ -3036,9 +3115,32 @@ bool TopLevelVisitor::VisitType(Type *T) {
 ///
 /////////////////////////////////////////////////////////////////////////////////
 
+/// Namespaces enclosing declaration D, outermost first
+static std::vector<const NamespaceDecl *> enclosing_namespaces(const Decl *D) {
+    std::vector<const NamespaceDecl *> ns;
+    for (const DeclContext *DC = D->getDeclContext(); DC != nullptr; DC = DC->getParent()) {
+        if (auto *NSD = dyn_cast<NamespaceDecl>(DC))
+            ns.insert(ns.begin(), NSD);
+    }
+    return ns;
+}
+
+static std::string open_namespace(const NamespaceDecl *NSD) {
+    std::string s = NSD->isInline() ? "inline namespace " : "namespace ";
+    if (!NSD->isAnonymousNamespace())
+        s += NSD->getNameAsString() + " ";
+    return s + "{\n";
+}
+
 SourceLocation
-TopLevelVisitor::spec_insertion_point(std::vector<const TemplateArgument *> &typeargs,
+TopLevelVisitor::spec_insertion_point(std::string &pre, std::string &post,
+                                      std::vector<const TemplateArgument *> &typeargs,
                                       SourceLocation ip, FunctionDecl *f) {
+
+    pre.clear();
+    post.clear();
+    // the record which determines the insertion point, if it is moved after it
+    const RecordDecl *moved_after = nullptr;
 
     if (f->hasBody() &&
         srcMgr.isBeforeInTranslationUnit(ip, f->getBody()->getSourceRange().getEnd())) {
@@ -3134,21 +3236,48 @@ TopLevelVisitor::spec_insertion_point(std::vector<const TemplateArgument *> &typ
         if (tp && !tp->isBuiltinType()) {
             RecordDecl *rd = tp->getAsRecordDecl();
             if (rd && srcMgr.isBeforeInTranslationUnit(ip, rd->getSourceRange().getBegin())) {
-                reportDiag(DiagnosticsEngine::Level::Warning, f->getSourceRange().getBegin(),
-                           "hilapp internal error: specialization insertion point for "
-                           "function \'%0\'"
-                           " appears to be before the declaration of type \'%1\', code "
-                           "might not compile",
-                           f->getQualifiedNameAsString().c_str(),
-                           tap->getAsType().getAsString().c_str());
-
-                // try to move the insertion point - fails, TODO: more carefully!
+                // The type is declared after the candidate insertion point: move it after
+                // the type, or after the outermost class containing the type
+                while (auto *outer = dyn_cast<RecordDecl>(rd->getDeclContext()))
+                    rd = outer;
+                // insert right after the ; of the declaration
                 ip = getRangeWithSemicolon(rd->getSourceRange()).getEnd().getLocWithOffset(1);
+                moved_after = rd;
             }
         }
     }
-    // skip to end of line -- is fine here
-    ip = findChar(ip, '\n');
+    // skip to end of line -- is fine here.  If moved after a type, the next line may be
+    // another declaration (or end of namespace), insert right after the type instead
+    if (moved_after == nullptr)
+        ip = findChar(ip, '\n');
+
+    if (moved_after != nullptr) {
+        // The specialization must be in the namespace of the function (template), but the
+        // insertion point is in the namespace of the type.  Close the namespaces of the type
+        // down to the common ones, open those of the function, and reverse after the
+        // specialization.
+        auto ns_ip = enclosing_namespaces(moved_after);
+        auto ns_f = enclosing_namespaces(f->getCanonicalDecl());
+        size_t common = 0;
+        while (common < ns_ip.size() && common < ns_f.size() &&
+               ns_ip[common]->getCanonicalDecl() == ns_f[common]->getCanonicalDecl())
+            common++;
+
+        if (ns_ip.size() > common) {
+            pre = "\n// hilapp: close namespaces for the specialization below\n";
+            for (size_t i = common; i < ns_ip.size(); i++)
+                pre += "}\n";
+            for (size_t i = common; i < ns_f.size(); i++)
+                pre += open_namespace(ns_f[i]);
+
+            for (size_t i = common; i < ns_f.size(); i++)
+                post += "}\n";
+            post += "// hilapp: reopen namespaces\n";
+            for (size_t i = common; i < ns_ip.size(); i++)
+                post += open_namespace(ns_ip[i]);
+        }
+    }
+
     return ip;
 }
 
@@ -3257,4 +3386,144 @@ void TopLevelVisitor::make_mapping_lists(const TemplateParameterList *tpl,
 void TopLevelVisitor::set_writeBuf(const FileID fid) {
     writeBuf = get_file_buffer(TheRewriter, fid);
     toplevelBuf = writeBuf;
+}
+
+
+/////////////////////////////////////////////////////////////////////////////
+/// Deep halo access: parse axis offsets X + k*dir (HALO_DEPTH > 1)
+/////////////////////////////////////////////////////////////////////////////
+
+/// value of HALO_DEPTH macro, 1 if deep halo access is not possible on this target
+int TopLevelVisitor::halo_depth() {
+    static int depth = -1;
+    if (depth < 0) {
+        depth = 1;
+        std::string arg;
+        if (is_macro_defined("HALO_DEPTH", &arg) && !target.vectorize && !target.openacc) {
+            depth = std::atoi(arg.c_str());
+            if (depth < 1)
+                depth = 1;
+        }
+    }
+    return depth;
+}
+
+static Expr *strip_axis_expr(Expr *e) {
+    while (true) {
+        e = e->IgnoreParens()->IgnoreImplicit();
+        if (auto *ce = dyn_cast<CXXConstructExpr>(e)) {
+            if (ce->getNumArgs() == 1) {
+                e = ce->getArg(0);
+                continue;
+            }
+        }
+        if (auto *fc = dyn_cast<CXXFunctionalCastExpr>(e)) {
+            e = fc->getSubExpr();
+            continue;
+        }
+        return e;
+    }
+}
+
+/// Collect terms (k, Direction expr) of a sum of X, Directions, int*Direction and
+/// Direction*int, with + and - (binary and unary).  Return false if something else.
+bool TopLevelVisitor::collect_axis_offset_terms(Expr *e, int sign, bool &has_X,
+                                                std::vector<std::pair<int, Expr *>> &terms) {
+    e = strip_axis_expr(e);
+    std::string type = get_expr_type(e);
+
+    if (type == "X_index_type") {
+        if (has_X || sign < 0)
+            return false;
+        has_X = true;
+        return true;
+    }
+
+    if (auto *op = dyn_cast<CXXOperatorCallExpr>(e)) {
+        std::string ops = getOperatorSpelling(op->getOperator());
+        int nargs = op->getNumArgs();
+
+        if (ops == "-" && nargs == 1 && type != "Direction") {
+            return collect_axis_offset_terms(op->getArg(0), -sign, has_X, terms);
+        }
+        if ((ops == "+" || ops == "-") && nargs == 2) {
+            return collect_axis_offset_terms(op->getArg(0), sign, has_X, terms) &&
+                   collect_axis_offset_terms(op->getArg(1), (ops == "+") ? sign : -sign, has_X,
+                                             terms);
+        }
+        if (ops == "*" && nargs == 2) {
+            Expr *a = strip_axis_expr(op->getArg(0));
+            Expr *b = strip_axis_expr(op->getArg(1));
+            if (get_expr_type(a) == "Direction")
+                std::swap(a, b);
+            if (get_expr_type(b) != "Direction" || !a->isIntegerConstantExpr(*Context))
+                return false;
+#if defined(__clang_major__) && (__clang_major__ <= 15)
+            int k = a->getIntegerConstantExpr(*Context).getValue().getExtValue();
+#else
+            int k = a->getIntegerConstantExpr(*Context).value().getExtValue();
+#endif
+            terms.push_back({sign * k, b});
+            return true;
+        }
+    }
+
+    if (type == "Direction") {
+        // a Direction-valued expression, incl. -d
+        terms.push_back({sign, e});
+        return true;
+    }
+
+    return false;
+}
+
+/// Parse X + k*dir, where all Direction expressions are identical.  dirE gets the
+/// Direction expr, k the multiplier (can be negative), atoms all Direction subexpressions
+bool TopLevelVisitor::parse_axis_offset(Expr *e, Expr *&dirE, int &k,
+                                        std::vector<Expr *> &atoms) {
+    bool has_X = false;
+    std::vector<std::pair<int, Expr *>> terms;
+    if (!collect_axis_offset_terms(e, 1, has_X, terms) || !has_X || terms.size() == 0)
+        return false;
+
+    dirE = terms[0].second;
+    k = 0;
+    atoms.clear();
+    for (auto &t : terms) {
+        if (!is_duplicate_expr(dirE, t.second))
+            return false;
+        k += t.first;
+        atoms.push_back(t.second);
+    }
+    return true;
+}
+
+/// Direction string of a deep halo ref.  in_loop: use names mapped in the loop buffer
+std::string TopLevelVisitor::deep_dir_string(const dir_ptr &d, srcBuf &loopBuf, bool in_loop) {
+    std::string s;
+    if (in_loop)
+        s = loopBuf.get(d.deep_dirExpr->getSourceRange());
+    else
+        s = get_stmt_str(d.deep_dirExpr);
+    if (d.deep_negate)
+        s = "-(" + s + ")";
+    return s;
+}
+
+/// deep halo gathers before the loop - these are complete before the loop starts
+void TopLevelVisitor::generate_deep_gathers(std::stringstream &code) {
+    srcBuf dummy;
+    for (field_info &l : field_info_list)
+        for (dir_ptr &d : l.dir_list)
+            if (d.deep_k > 0)
+                code << l.new_name << ".gather_depth(" << deep_dir_string(d, dummy, false)
+                     << ", " << d.deep_k << ");\n";
+}
+
+bool TopLevelVisitor::has_deep_refs() {
+    for (field_info &l : field_info_list)
+        for (dir_ptr &d : l.dir_list)
+            if (d.deep_k > 0)
+                return true;
+    return false;
 }

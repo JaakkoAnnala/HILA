@@ -110,6 +110,19 @@ class Field {
 #endif
         T *send_buffer[NDIRS];
 
+#if HALO_DEPTH > 1
+        // deep halo gathers (layers 0..depth-1, always ALL parity), see start_gather_depth()
+        gather_status_t deep_status[NDIRS];
+        int deep_depth[NDIRS];       // depth of the started or done gather
+        unsigned deep_n[2][NDIRS];   // number of elements in layer 0 / deeper layers message
+        MPI_Request deep_receive_request[2][NDIRS];
+        MPI_Request deep_send_request[2][NDIRS];
+        T *deep_send_buffer[NDIRS];
+#ifndef VANILLA
+        T *deep_receive_buffer[NDIRS];
+#endif
+#endif
+
 #ifdef FIELD_SHIFT_BUFFERING
         struct shift_buffer_struct {
             Field<T> f;
@@ -188,6 +201,14 @@ class Field {
 #ifndef VANILLA
                 receive_buffer[d] = nullptr;
 #endif
+#if HALO_DEPTH > 1
+                deep_status[d] = gather_status_t::NOT_DONE;
+                deep_depth[d] = 0;
+                deep_send_buffer[d] = nullptr;
+#ifndef VANILLA
+                deep_receive_buffer[d] = nullptr;
+#endif
+#endif
             }
         }
 
@@ -207,6 +228,18 @@ class Field {
                     payload.free_mpi_buffer(receive_buffer[d]);
                     receive_buffer[d] = nullptr;
                 }
+#endif
+#if HALO_DEPTH > 1
+                if (deep_send_buffer[d] != nullptr) {
+                    payload.free_mpi_buffer(deep_send_buffer[d]);
+                    deep_send_buffer[d] = nullptr;
+                }
+#ifndef VANILLA
+                if (deep_receive_buffer[d] != nullptr) {
+                    payload.free_mpi_buffer(deep_receive_buffer[d]);
+                    deep_receive_buffer[d] = nullptr;
+                }
+#endif
 #endif
             }
         }
@@ -597,6 +630,11 @@ class Field {
                 set_gather_status(EVEN, i, gather_status_t::NOT_DONE);
                 set_gather_status(ODD, i, gather_status_t::NOT_DONE);
             }
+#if HALO_DEPTH > 1
+            // deep halos are ALL parity, any change invalidates them (drop_comms waited above)
+            fs->deep_status[i] = gather_status_t::NOT_DONE;
+            fs->deep_depth[i] = 0;
+#endif
         }
         fs->assigned_to |= parity_bits(p);
 
@@ -1401,6 +1439,13 @@ class Field {
     void gather(Direction d, Parity p = ALL) const;
     void drop_comms(Direction d, Parity p) const;
 
+    // Deep halo gathers: halo layers 0..depth-1 in direction d, ALL parity.  depth 1 is
+    // the standard nn gather; depth > 1 requires HALO_DEPTH >= depth.
+    dir_mask_t start_gather_depth(Direction d, int depth) const;
+    void wait_gather_depth(Direction d, int depth) const;
+    void gather_depth(Direction d, int depth) const;
+    bool is_gathered_depth(Direction d, int depth) const;
+
     /**
      * @brief Create a periodically shifted copy of the field
      * @details  this is currently OK only for short moves, very inefficient for longer moves
@@ -1628,6 +1673,11 @@ class Field {
     // Fourier transform declaration
     Field<T> FFT(fft_direction fdir = fft_direction::forward) const;
     Field<T> FFT(const CoordinateVector &dirs, fft_direction fdir = fft_direction::forward) const;
+
+    // real Fourier transform of real fields, see FFT_real_field() in fft.h
+    Field<T> FFT_real(fft_direction fdir = fft_direction::forward) const;
+    Field<T> FFT_real(const CoordinateVector &dirs,
+                      fft_direction fdir = fft_direction::forward) const;
 
     Field<Complex<hila::arithmetic_type<T>>>
     FFT_real_to_complex(fft_direction fdir = fft_direction::forward) const;
@@ -2251,6 +2301,13 @@ template <typename T>
 void Field<T>::drop_comms(Direction d, Parity p) const {
 #if !defined(GPU_CCL)
     if (hila::is_comm_initialized()) {
+#if HALO_DEPTH > 1
+        if (fs->deep_status[d] == gather_status_t::STARTED) {
+            drop_comms_timer.start();
+            wait_gather_depth(d, fs->deep_depth[d]);
+            drop_comms_timer.stop();
+        }
+#endif
         if (is_gather_started(d, ALL)) {
             drop_comms_timer.start();
             wait_gather(d, ALL);

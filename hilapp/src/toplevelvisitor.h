@@ -116,7 +116,8 @@ class TopLevelVisitor : public GeneralVisitor, public RecursiveASTVisitor<TopLev
                             std::vector<std::string> &par, std::vector<std::string> &arg,
                             std::vector<const TemplateArgument *> &typeargs, std::string *al);
 
-    SourceLocation spec_insertion_point(std::vector<const TemplateArgument *> &typeargs,
+    SourceLocation spec_insertion_point(std::string &pre, std::string &post,
+                                        std::vector<const TemplateArgument *> &typeargs,
                                         SourceLocation ip, FunctionDecl *f);
 
     // bool VisitCXXRecordDecl( CXXRecordDecl * D);
@@ -135,6 +136,17 @@ class TopLevelVisitor : public GeneralVisitor, public RecursiveASTVisitor<TopLev
     bool check_field_ref_list();
 
     void check_var_info_list();
+
+    /// Parse X + k*dir -type axis offset, see toplevelvisitor.cpp
+    bool parse_axis_offset(Expr *e, Expr *&dirE, int &k, std::vector<Expr *> &atoms);
+    bool collect_axis_offset_terms(Expr *e, int sign, bool &has_X,
+                                   std::vector<std::pair<int, Expr *>> &terms);
+    int halo_depth();
+
+    /// code generation helpers for deep halo access
+    std::string deep_dir_string(const dir_ptr &d, srcBuf &loopBuf, bool in_loop);
+    void generate_deep_gathers(std::stringstream &code);
+    bool has_deep_refs();
 
     bool handle_field_X_expr(Expr *e, bool &is_assign, bool is_compound, bool is_X,
                              bool is_func_arg = false);
@@ -241,6 +253,8 @@ class TopLevelVisitor : public GeneralVisitor, public RecursiveASTVisitor<TopLev
     /// Generate a header for starting communication and marking fields changed
     std::string generate_code_cpu(Stmt *S, bool semicolon_at_end, srcBuf &sb, bool generate_wait);
     std::string generate_code_gpu(Stmt *S, bool semicolon_at_end, srcBuf &sb, bool generate_wait);
+    std::string local_using_declarations(Stmt *S);
+    void collect_local_usings(Stmt *st, Stmt *loop, SourceLocation loop_loc, std::string &out);
     void generate_openacc_loop_header(std::stringstream &code);
     //   std::string generate_code_openacc(Stmt *S, bool semicolon_at_end, srcBuf &sb);
     std::string generate_code_avx(Stmt *S, bool semicolon_at_end, srcBuf &sb, bool generate_wait);

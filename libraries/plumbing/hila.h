@@ -7,6 +7,11 @@
 
 
 #include "plumbing/defs.h"
+
+#include "plumbing/globals.h"
+
+#include "plumbing/philox.h"
+
 #include "datatypes/cmplx.h"
 #include "datatypes/matrix.h"
 #include "datatypes/element_by_element.h"
@@ -15,7 +20,6 @@
 #include "datatypes/su2.h"
 #include "datatypes/extended.h"
 
-#include "plumbing/globals.h"
 #include "plumbing/coordinates.h"
 #include "plumbing/lattice.h"
 #include "plumbing/site_index.h"
@@ -44,7 +48,6 @@
 #include <omp.h>
 #endif
 
-#include "plumbing/random.h"
 
 #include "plumbing/shuffle.h"
 

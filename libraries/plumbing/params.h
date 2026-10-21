@@ -44,10 +44,48 @@
 /**
  * @brief  EVEN_SITES_FIRST is default. To traverse sites on natural (parity invariant) order use
  * -DEVEN_SITES_FIRST=0
+ * @details Without EVEN_SITES_FIRST sites are stored in lexicographic order (x fastest), and
+ * neighbour indices and coordinates are always computed on the fly (implies
+ * LAYOUT_ON_THE_FLY).  Loops with parity EVEN or ODD work, but go through all sites, and
+ * all halo communications are done with parity ALL.  Not available with vectorized (AVX)
+ * targets or GPU_OVERLAP_COMM.
  */
 #define EVEN_SITES_FIRST
 #elif EVEN_SITES_FIRST == 0
 #undef EVEN_SITES_FIRST
+#endif
+
+/**
+ * @brief LAYOUT_ON_THE_FLY: compute neighbour indices and site coordinates arithmetically
+ * (see site_layout.h) instead of storing per-site arrays lattice.neighb[] and coordinates
+ * (and their GPU copies).  Saves (4*NDIRS + 4*NDIM) bytes/site on GPUs.
+ * Not available with GPU_OVERLAP_COMM or vectorized (AVX) targets.  Off by default, enable
+ * with -DLAYOUT_ON_THE_FLY.  Always on if EVEN_SITES_FIRST=0.
+ */
+#ifdef LAYOUT_ON_THE_FLY
+#if LAYOUT_ON_THE_FLY == 0
+#undef LAYOUT_ON_THE_FLY
+#ifndef EVEN_SITES_FIRST
+#error "EVEN_SITES_FIRST=0 always uses LAYOUT_ON_THE_FLY, it cannot be turned off"
+#endif
+#endif
+#endif
+
+#if !defined(EVEN_SITES_FIRST) && !defined(LAYOUT_ON_THE_FLY)
+#define LAYOUT_ON_THE_FLY
+#endif
+
+/**
+ * @brief HALO_DEPTH: number of halo layers allocated for each communicated direction.
+ * @details Default 1 (nearest neighbours only).  With HALO_DEPTH = D > 1, layers 2..D are
+ * allocated after the nearest-neighbour halos (see site_layout.h), enabling direct access
+ * to f[X + k*d] with k <= D.  With EVEN_SITES_FIRST the nearest-neighbour halo layout is
+ * unchanged.  Costs
+ * (D-1) * (boundary surface) elements per field.  Not with GPU_OVERLAP_COMM or vectorized
+ * targets.  Local node size in divided directions must be >= D.
+ */
+#ifndef HALO_DEPTH
+#define HALO_DEPTH 1
 #endif
 
 /// NODE_LAYOUT_TRIVIAL or NODE_LAYOUT_BLOCK determine how MPI ranks are laid out on logical
@@ -74,7 +112,6 @@
 #ifndef WRITE_BUFFER_SIZE
 #define WRITE_BUFFER_SIZE 2000000
 #endif
-
 
 // boundary conditions are "off" by default -- no need to do anything here
 // #ifndef SPECIAL_BOUNDARY_CONDITIONS
@@ -118,6 +155,20 @@
 #endif
 
 /**
+ * @brief GPU_GLOBALS_IN_CONSTANT_MEMORY if set and !=0, user hila::global variables are placed
+ * in GPU __constant__ memory, otherwise in __device__ (global) memory.  Off by default:
+ * the CUDA device linker (at least up to CUDA 13.3) does not always lay out __constant__
+ * variables defined in several compilation units correctly, leading to "invalid argument"
+ * errors in cudaMemcpyToSymbol().  The hila system globals are always in constant memory,
+ * all defined in hila_gpu.cpp.
+ */
+#ifndef GPU_GLOBALS_IN_CONSTANT_MEMORY
+// leave undefined by default
+#elif GPU_GLOBALS_IN_CONSTANT_MEMORY == 0
+#undef GPU_GLOBALS_IN_CONSTANT_MEMORY
+#endif
+
+/**
  * @brief GPU_OVERLAP_COMM if set and !=0, overlap communication and computation in onsites()-loops.
  * Enable with -DGPU_OVERLAP_COMM=1
  */
@@ -125,28 +176,6 @@
 // leave undefined by default
 #elif GPU_OVERLAP_COMM == 0
 #undef GPU_OVERLAP_COMM
-#endif
-
-/// @brief  GPU_RNG_THREAD_BLOCKS number of blocks to use in onsites()-loops containing random
-/// numbers. Default is 32. Number of thread blocks (of N_threads threads) to use in onsites()-loops
-/// containing random numbers. GPU_RNG_THREAD_BLOCKS=0 or undefined means use one RNG on each
-/// lattice site, and the thread block number is not restricted.  RNG takes about 48 B/generator
-/// (with XORWOW). When GPU_RNG_THREAD_BLOCKS > 0 only (N_threads * GPU_RNG_THREAD_BLOCKS)
-/// generators are in use, which reduces the memory footprint substantially (and bandwidth demand)
-/// Too small number slows down onsites()-loops containing RNGs, because less threads are active.
-/// Example:
-///     Field<Vector<4,double>> vfield;
-///     onsites(ALL) {
-///        vfield[X].gaussian_random();      // there's RNG here, so this onsites() is handled by
-///                                          // GPU_RNG_THREAD_BLOCKS thread blocks
-///     }
-/// GPU_RNG_THREAD_BLOCKS<0 disables GPU random numbers entirely, and loops like above will crash if
-/// executed. hilapp will emit a warning, but program is compiled
-///
-///  Default: 32 seems to be OK compromise. Can be set to 0 if memory is not a problem.
-
-#ifndef GPU_RNG_THREAD_BLOCKS
-#define GPU_RNG_THREAD_BLOCKS 32
 #endif
 
 /// GPU_VECTOR_REDUCTION_THREAD_BLOCKS
