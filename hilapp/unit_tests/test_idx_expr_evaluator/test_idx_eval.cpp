@@ -1220,6 +1220,81 @@ constexpr auto add10 = [](auto &a){
     TEST_CASE_END;
 }
 
+// For test_ref_arg_constexpr_increment(): an operator can not be defined inside the test function
+namespace ref_arg_increment_test {
+enum Dir : unsigned { e_x = 0, e_y, e_z, e_z_down, e_y_down, e_x_down, NDIRS };
+constexpr Dir &operator++(Dir &d) {
+    return d = static_cast<Dir>(static_cast<unsigned>(d) + 1);
+}
+} // namespace ref_arg_increment_test
+
+bool test_ref_arg_constexpr_increment() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // A loop stepped with a constexpr operator++ taking the loop variable by reference, like
+    // HILA's operator++(Direction &). Without writing back the parameter, d would stay e_x.
+    TEST_EVAL_STRING_TOPLVL(R"(
+enum Dir : unsigned { e_x = 0, e_y, e_z, e_z_down, e_y_down, e_x_down, NDIRS };
+constexpr Dir &operator++(Dir &d){
+    return d = static_cast<Dir>(static_cast<unsigned>(d) + 1);
+}
+void test(){
+    int sum = 0;
+    for (Dir d = e_x; d < NDIRS; ++d)
+        sum += d;
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it, with the enum and operator above
+    using namespace ref_arg_increment_test;
+//void test(){
+    TrackedVar<int> sum = 0;
+    for (Dir d = e_x; d < NDIRS; ++d)
+        sum += d;
+//}
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(sum);
+
+    TEST_CASE_END;
+}
+
+bool test_ref_arg_temporary() {
+    TEST_CASE_BEGIN;
+    /////////////////////////////////////////////
+    // A temporary bound to a reference parameter, e.g. 5 in consume(5) with consume(int &&),
+    // can not change any variable: the variables stay known.
+    TEST_EVAL_STRING_TOPLVL(R"(
+void consume(int &&a);
+void test(){
+    int x = 0;
+    int y = 2;
+    consume(5);
+    consume(x + 1);
+    y = x;
+}
+    )")
+    /////////////////////////////////////////////
+    // clang-format off
+    // Really evaluate it
+// void consume(int &&a);
+auto consume = [](int &&a) { (void)a; };
+//void test(){
+    TrackedVar<int> x = 0;
+    TrackedVar<int> y = 2;
+    consume(5);
+    consume(x + 1);
+    y = x;
+//}
+    // clang-format on
+    /////////////////////////////////////////////
+    COMPARE_AND_SET_TEST_PASS(x);
+    COMPARE_AND_SET_TEST_PASS(y);
+
+    TEST_CASE_END;
+}
+
 bool test_ref_arg_constructor() {
     TEST_CASE_BEGIN;
     /////////////////////////////////////////////
@@ -2537,7 +2612,9 @@ static std::vector<test_func> test_cases = {
     // changes through references
     test_ref_arg_unknown_function,
     test_ref_arg_constexpr_function,
+    test_ref_arg_constexpr_increment,
     test_ref_arg_constructor,
+    test_ref_arg_temporary,
     test_ref_variable,
     test_ref_variable_chains,
     test_ref_variable_unknown_target,

@@ -281,6 +281,45 @@ static void write_through_unknown_reference(Eval_state &state) {
     }
 }
 
+// Reference arguments of calls: an argument bound to a non-const reference to an integer, e.g.
+// `x` in f(x) with void f(int &a), can be changed by the call. Such an argument is a non-const
+// glvalue, also for int && and forwarding references (std::move(x)), function pointers, member
+// functions, operators and constructors. An argument passed by value is a prvalue after the
+// lvalue-to-rvalue conversion, one bound to a const reference has a const type.
+// The exception is a temporary bound to a reference, eg 5 in f(5) with void f(int &&a): is a
+// non-const glvalue too, but no variable refers to it.
+static bool is_writable_int_reference_arg(const Expr *arg) {
+    return arg->isGLValue() && !arg->getType().isConstQualified() &&
+           arg->getType()->isIntegralOrEnumerationType() &&
+           !isa<MaterializeTemporaryExpr>(arg->IgnoreParens());
+}
+
+// The variable a reference argument refers to, also through reference variables. nullptr if it
+// can not be determined, e.g. `c ? x : y`.
+static const VarDecl *referenced_var(const Expr *arg, ASTContext &ASTctx) {
+    const VarDecl *VD = lvalue_var(arg, ASTctx);
+    if (VD != nullptr && is_alias_reference(VD))
+        VD = alias_reference_target(VD, ASTctx);
+    return VD;
+}
+
+// Update the state after a call for a reference argument `arg`, eg `x` in f(x) with
+// void f(int &a): the variable that `arg` refers to now has the value `value`.
+//  - For an evaluated constexpr call, `value` is the value of the reference parameter `a` at
+//    the end of the callee
+//  - For a call that is not evaluated, `value` is unknown (std::nullopt).
+// If we can not determine which variable `arg` refers to, the call may have changed any of
+// them, so all variables become unknown
+static void write_reference_arg(const Expr *arg, std::optional<int64_t> value, Eval_state &state,
+                                ASTContext &ASTctx) {
+    if (const VarDecl *VD = referenced_var(arg, ASTctx)) {
+        state.vars[VD] = to_int_type(value, VD->getType(), ASTctx);
+        state.all_possible_vals[VD].insert(state.vars[VD]);
+    } else {
+        write_through_unknown_reference(state);
+    }
+}
+
 // recursively eval
 bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext &ASTctx) {
     result.val = std::nullopt;
@@ -678,6 +717,11 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         const auto *method = dyn_cast_or_null<CXXMethodDecl>(func);
         const unsigned first_param_arg =
             (isa<CXXOperatorCallExpr>(CE) && method != nullptr && !method->isStatic()) ? 1 : 0;
+
+        // arguments bound to non-const references to integers, which the call can change, with
+        // the parameter (nullptr if none or the call is not evaluated)
+        std::vector<std::pair<const Expr *, const ParmVarDecl *>> reference_args;
+
         unsigned i = 0;
         for (const Expr *arg_expr : CE->arguments()) {
             // the ->arguments() contains CXXDefaultArgExpr which are now taken care of the
@@ -687,13 +731,16 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             // which can affect the result..
             if (!eval_expr(arg_val, arg_expr, state, ASTctx))
                 return false;
+            const ParmVarDecl *param = nullptr;
             if (do_eval && i >= first_param_arg && i - first_param_arg < func->getNumParams()) {
-                const ParmVarDecl *param = func->getParamDecl(i - first_param_arg);
+                param = func->getParamDecl(i - first_param_arg);
                 // A worklist path may reach a constexpr call with an unknown
                 // argument. Preserve that fact in the callee instead of
                 // throwing std::bad_optional_access here.
                 call_state.vars[param] = arg_val.val;
             }
+            if (is_writable_int_reference_arg(arg_expr))
+                reference_args.push_back({arg_expr, param});
             i++;
         }
 
@@ -717,10 +764,29 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             if (!eval_constexpr_function(func, call_state, ASTctx))
                 return false;
 
+            // Write back the values of reference parameters, e.g. `dir` in
+            // constexpr Direction &operator++(Direction &dir). The callee state holds the values
+            for (const auto &[arg, param] : reference_args) {
+                std::optional<int64_t> value;
+                if (param != nullptr) {
+                    if (const auto it = call_state.vars.find(param); it != call_state.vars.end())
+                        value = it->second;
+                }
+                write_reference_arg(arg, value, state, ASTctx);
+            }
+
             // The callee can execute successfully while still having an
             // unknown return value (when argument is unknown)
             result.val = call_state.return_val;
             goto successful_return;
+        }
+
+        // A function we do not evaluate may change the variables passed by reference
+        for (const auto &[arg, param] : reference_args) {
+            INTERNAL_NOTE_IF(arg) << "Variable passed by reference to a function that is not "
+                                     "evaluated, its value is unknown after the call "
+                                  << loc_str(arg) << "\n";
+            write_reference_arg(arg, std::nullopt, state, ASTctx);
         }
         goto successful_return;
 
@@ -750,6 +816,15 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             Eval_result arg_val{};
             if (!eval_expr(arg_val, arg_expr, state, ASTctx))
                 return false;
+        }
+        // the constructor is not evaluated, it may change the variables passed by reference
+        for (auto arg_expr : constructor_expr->arguments()) {
+            if (is_writable_int_reference_arg(arg_expr)) {
+                INTERNAL_NOTE_IF(arg_expr) << "Variable passed by reference to a constructor, its "
+                                              "value is unknown after the call "
+                                           << loc_str(arg_expr) << "\n";
+                write_reference_arg(arg_expr, std::nullopt, state, ASTctx);
+            }
         }
 
         // TODO(CXXConstructExpr):  ... not trying to eval these for now
@@ -1598,6 +1673,12 @@ static bool eval_CFG_worklist(const CFG &cfg, Eval_state &state, ASTContext &AST
 static bool eval_constexpr_function(const FunctionDecl *func, Eval_state &state,
                                     ASTContext &ASTctx) {
     Function_eval_cache *cache = state.func_cache;
+    // The cache holds only the return value, not the values of reference parameters
+    for (const ParmVarDecl *param : func->parameters()) {
+        const QualType T = param->getType();
+        if (T->isReferenceType() && !T.getNonReferenceType().isConstQualified())
+            cache = nullptr;
+    }
 
     // The callee does not track any expressions and its variables are not reported, so the
     // return value is all we need from an earlier call with the same arguments.
