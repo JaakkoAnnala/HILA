@@ -5,6 +5,7 @@
 
 #include <llvm/ADT/Hashing.h>
 
+#include <algorithm>
 #include <limits>
 #include <unordered_set>
 
@@ -74,6 +75,132 @@ bool eval_stmt(const Stmt *S, Eval_state &state, ASTContext &ASTctx);
 bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext &ASTctx);
 static bool eval_constexpr_function(const FunctionDecl *func, Eval_state &state,
                                     ASTContext &ASTctx);
+
+// The values are represented with int64_t, but follow the semantics of the C++ types of the
+// expressions. to_int_type() converts a value to a type as c++ would, int_binary_op() does
+// the binop evaluation.
+//
+// The value `v` converted to type T: truncated to the width of T and sign or zero extended.
+// Unknown if T is not an integer type, or if the value does not fit in int64_t.
+static std::optional<int64_t> to_int_type(std::optional<int64_t> v, QualType T,
+                                          const ASTContext &ASTctx) {
+    if (!v.has_value())
+        return std::nullopt;
+    T = T.getNonReferenceType().getCanonicalType();
+    if (T->isBooleanType())
+        return v.value() != 0;
+    if (!T->isIntegralOrEnumerationType())
+        return std::nullopt;
+    const uint64_t width = ASTctx.getIntWidth(T);
+    const bool is_signed = T->isSignedIntegerOrEnumerationType();
+    uint64_t u = static_cast<uint64_t>(v.value());
+    if (width < 64) {
+        const uint64_t mask = (uint64_t(1) << width) - 1;
+        u &= mask;
+        if (is_signed && ((u >> (width - 1)) & 1))
+            u |= ~mask; // sign extend
+        return static_cast<int64_t>(u);
+    }
+    if (width > 64 || (!is_signed && static_cast<int64_t>(u) < 0))
+        return std::nullopt;
+    return static_cast<int64_t>(u);
+}
+
+// Evaluate binary operator `op` for integers `a` and `b` (also used for the compound assignment
+// versions). Gives unknown if the result would overflow int64_t or is undefined (division by zero,
+// shift out of range), and then sets `*undefined` to the reason. Gives unknown also
+// for operators that do not give an integer value. The result has to be converted to the type of
+// the expression with to_int_type().
+static std::optional<int64_t> int_binary_op(BinaryOperatorKind op, int64_t a, int64_t b,
+                                            const char **undefined = nullptr) {
+    auto undefined_result = [&](const char *reason) -> std::optional<int64_t> {
+        if (undefined)
+            *undefined = reason;
+        return std::nullopt;
+    };
+    constexpr int64_t int64_min = std::numeric_limits<int64_t>::min();
+    int64_t r;
+    switch (op) {
+        // the __builtin_* return true if the operation results into an overflow
+    case BO_Mul:
+    case BO_MulAssign:
+        return __builtin_mul_overflow(a, b, &r) ? undefined_result("overflows int64_t")
+                                                : std::optional<int64_t>(r);
+    case BO_Add:
+    case BO_AddAssign:
+        return __builtin_add_overflow(a, b, &r) ? undefined_result("overflows int64_t")
+                                                : std::optional<int64_t>(r);
+    case BO_Sub:
+    case BO_SubAssign:
+        return __builtin_sub_overflow(a, b, &r) ? undefined_result("overflows int64_t")
+                                                : std::optional<int64_t>(r);
+    case BO_Div:
+    case BO_DivAssign:
+        if (b == 0)
+            return undefined_result("division by zero");
+        if (a == int64_min && b == -1)
+            return undefined_result("overflows int64_t");
+        return a / b;
+    case BO_Rem:
+    case BO_RemAssign:
+        if (b == 0)
+            return undefined_result("division by zero");
+        if (a == int64_min && b == -1)
+            return undefined_result("overflows int64_t");
+        return a % b;
+    case BO_Shl:
+    case BO_ShlAssign:
+        if (a < 0)
+            return undefined_result("left shift of a negative value");
+        if (b < 0 || b >= 64)
+            return undefined_result("shift amount out of range");
+        return static_cast<int64_t>(static_cast<uint64_t>(a) << b);
+    case BO_Shr:
+    case BO_ShrAssign:
+        if (b < 0 || b >= 64)
+            return undefined_result("shift amount out of range");
+        return a >> b;
+    case BO_LT:
+        return a < b;
+    case BO_GT:
+        return a > b;
+    case BO_LE:
+        return a <= b;
+    case BO_GE:
+        return a >= b;
+    case BO_EQ:
+        return a == b;
+    case BO_NE:
+        return a != b;
+    case BO_And:
+    case BO_AndAssign:
+        return a & b;
+    case BO_Xor:
+    case BO_XorAssign:
+        return a ^ b;
+    case BO_Or:
+    case BO_OrAssign:
+        return a | b;
+    default:
+        // e.g. pointer to member. Also the C++20 three-way comparison `a <=> b` (BO_Cmp) on
+        // purpose: its type is the class std::strong_ordering, so its value would be unknown
+        // anyway after to_int_type() ...
+        return std::nullopt;
+    }
+}
+
+// Helper for int_binary_op() that reports a note for expr E, if the result is unknown
+static std::optional<int64_t> eval_int_binary_op(BinaryOperatorKind op, int64_t a, int64_t b,
+                                                 const Expr *E, ASTContext &ASTctx) {
+    const char *undefined = nullptr;
+    std::optional<int64_t> r = int_binary_op(op, a, b, &undefined);
+    if (undefined) {
+        INTERNAL_NOTE_IF(E) << "`" << BinaryOperator::getOpcodeStr(op) << "` with values " << a
+                            << " and " << b << ": " << undefined << ", the result is unknown "
+                            << loc_str(E) << "\n";
+    }
+    return r;
+}
 
 // Helper that adds the result of Expr E to the state.possible_vals_for_expr
 // if we are tracking the Expr E
@@ -204,19 +331,26 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         result = paren_expr_val;
         goto successful_return;
 
-    } else if (const auto *IC = dyn_cast<ImplicitCastExpr>(E)) {
-        // Must come before the DeclRefExpr case below, which looks through implicit casts and
-        // would otherwise skip e.g. the int -> bool conversion in `bool t = x;`.
-        // Evaluate one cast level at a time so nested casts are all applied.
-        if (!eval_expr(result, IC->getSubExpr(), state, ASTctx))
+    } else if (const auto *cast = dyn_cast<CastExpr>(E)) {
+        // Implicit and explicit casts. Must come before the DeclRefExpr case below, which looks
+        // through implicit casts and would otherwise skip e.g. the int -> bool conversion in
+        // `bool t = x;`. Evaluate one cast level at a time so nested casts are all applied.
+        if (!eval_expr(result, cast->getSubExpr(), state, ASTctx))
             return false;
 
-        if (IC->getCastKind() == CK_IntegralToBoolean) {
-            if (result.val.has_value())
-                result.val = (bool)result.val.value();
-        } else if (IC->getCastKind() != CK_LValueToRValue && IC->getCastKind() != CK_NoOp) {
-            // TODO: Interpret Implicit casts as a nop.. This might not be correct..
-            INTERNAL_NOTE_IF(E) << "Ignoring implicit cast " << IC->getCastKindName() << "\n";
+        switch (cast->getCastKind()) {
+        case CK_NoOp:
+        case CK_LValueToRValue:
+        case CK_IntegralCast:
+        case CK_IntegralToBoolean:
+        case CK_UserDefinedConversion: // the value of the conversion function call
+        case CK_ConstructorConversion:
+            // the value is converted to the type of the cast at successful_return
+            break;
+        default:
+            INTERNAL_NOTE_IF(E) << "Not evaluating cast " << cast->getCastKindName()
+                                << ", the value is unknown " << loc_str(E) << "\n";
+            result.val = std::nullopt;
         }
         goto successful_return;
 
@@ -230,8 +364,9 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
 
         const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
         if (!VD) {
-            INTERNAL_ERROR << " No VarDecl found for DeclRefExpr " << loc_str(DRE) << "\n";
-            return false;
+            // e.g. a function name, should be nothing we care about
+            INTERNAL_NOTE_IF(E) << " Not a variable, the value is unknown " << loc_str(DRE) << "\n";
+            goto successful_return;
         }
 
         if (is_alias_reference(VD)) {
@@ -246,6 +381,13 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         }
 
         if (state.vars.find(VD) == state.vars.end()) {
+            // A constant declared outside the evaluated code, e.g. `constexpr int N = 4;`
+            if (VD->isUsableInConstantExpressions(ASTctx)) {
+                if (const APValue *value = VD->evaluateValue(); value && value->isInt()) {
+                    result.val = value->getInt().tryExtValue();
+                    goto successful_return;
+                }
+            }
 
             INTERNAL_NOTE_IF(E) << " the variable has an unknown value " << loc_str(DRE) << "\n"
                                 << "             : VarDecl " << loc_str(VD) << " " << VD << "\n";
@@ -320,34 +462,31 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
                 //// [C99 6.5.16] Assignment operators.
                 // BO_Assign // "="
             case BO_Assign: {
-                state.vars[VD] = rhs_res.val;
+                state.vars[VD] = to_int_type(rhs_res.val, VD->getType(), ASTctx);
                 result = rhs_res;
                 // var changes
                 state.all_possible_vals[VD].insert(state.vars[VD]);
                 goto successful_return;
             }
-// temp helper macro to generate all the similar cases
-#define BOP_ASSIGN(OP)                                                                             \
-    {                                                                                              \
-        if (state.vars[VD].has_value())                                                            \
-            state.vars[VD].value() OP rhs_res.val.value();                                         \
-        result.val = state.vars[VD];                                                               \
-        state.all_possible_vals[VD].insert(state.vars[VD]);                                        \
-        goto successful_return;                                                                    \
-    }
-                // clang-format off
-            case BO_MulAssign: BOP_ASSIGN(*=); break;
-            case BO_DivAssign: BOP_ASSIGN(/=); break;
-            case BO_RemAssign: BOP_ASSIGN(%=); break;
-            case BO_AddAssign: BOP_ASSIGN(+=); break;
-            case BO_SubAssign: BOP_ASSIGN(-=); break;
-            case BO_ShlAssign: BOP_ASSIGN(<<=); break;
-            case BO_ShrAssign: BOP_ASSIGN(>>=); break;
-            case BO_AndAssign: BOP_ASSIGN(&=); break;
-            case BO_XorAssign: BOP_ASSIGN(^=); break;
-            case BO_OrAssign:  BOP_ASSIGN(|=); break;
-#undef BOP_ASSIGN
-            // clang-format on
+            case BO_MulAssign:
+            case BO_DivAssign:
+            case BO_RemAssign:
+            case BO_AddAssign:
+            case BO_SubAssign:
+            case BO_ShlAssign:
+            case BO_ShrAssign:
+            case BO_AndAssign:
+            case BO_XorAssign:
+            case BO_OrAssign: {
+                // the result is converted to the type of the variable, eg unsigned wraps
+                if (state.vars[VD].has_value())
+                    state.vars[VD] = to_int_type(eval_int_binary_op(op, state.vars[VD].value(),
+                                                                    rhs_res.val.value(), E, ASTctx),
+                                                 VD->getType(), ASTctx);
+                result.val = state.vars[VD];
+                state.all_possible_vals[VD].insert(state.vars[VD]);
+                goto successful_return;
+            }
             default:
                 INTERNAL_ERROR << " eval_expr BO opcode not implemented `" << BO->getOpcodeStr()
                                << "` " << loc_str(BO) << "\n";
@@ -391,59 +530,10 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
             if (!lhs_res.val.has_value() || !rhs_res.val.has_value())
                 goto successful_return; // We dont know the values just return the nullopt
 
-            if ((op == BO_Div || op == BO_Rem) &&
-                (rhs_res.val.value() == 0 ||
-                 (rhs_res.val.value() == -1 &&
-                  lhs_res.val.value() == std::numeric_limits<int64_t>::min()))) {
-                // Undefined behaviour...
-                INTERNAL_NOTE_IF(E) << "Division by zero or overflow, the result is unknown "
-                                    << loc_str(BO) << "\n";
-                goto successful_return;
-            }
-
-            switch (op) {
-
-// temp helper macro to generate all the similar cases
-#define BOP_EXPR(OP)                                                                               \
-    {                                                                                              \
-        result.val = lhs_res.val.value() OP rhs_res.val.value();                                   \
-        goto successful_return;                                                                    \
-    }
-                // clang-format off
-            case BO_Mul: BOP_EXPR(*); break;
-            case BO_Div: BOP_EXPR(/); break;
-            case BO_Rem:  BOP_EXPR(%); break;
-                //// [C99 6.5.6] Additive operators.
-            case BO_Add:  BOP_EXPR(+); break;
-            case BO_Sub:  BOP_EXPR(-); break;
-                //// [C99 6.5.7] Bitwise shift operators.
-            case BO_Shl:  BOP_EXPR(<<); break;
-            case BO_Shr:  BOP_EXPR(>>); break;
-#if __cplusplus >= 202002L
-            //// C++20 [expr.spaceship] Three-way comparison operator.
-            case BO_Cmp:  BOP_EXPR(<=>); break;
-#endif
-                //// [C99 6.5.8] Relational operators.
-            case BO_LT:  BOP_EXPR(<); break;
-            case BO_GT:  BOP_EXPR(>); break;
-            case BO_LE:  BOP_EXPR(<=); break;
-            case BO_GE:  BOP_EXPR(>=); break;
-            //// [C99 6.5.9] Equality operators.
-            case BO_EQ:  BOP_EXPR(==); break;
-            case BO_NE:  BOP_EXPR(!=); break;
-                //// [C99 6.5.10] Bitwise AND operator.
-            case BO_And:  BOP_EXPR(&); break;
-                //// [C99 6.5.11] Bitwise XOR operator.
-            case BO_Xor:  BOP_EXPR(^); break;
-                //// [C99 6.5.12] Bitwise OR operator.
-            case BO_Or:  BOP_EXPR(|); break;
-                // clang-format on
-#undef BOP_EXPR
-            default:
-                INTERNAL_ERROR << " TODO: eval_expr BO opcode not implemented `"
-                               << BO->getOpcodeStr() << "` " << loc_str(BO) << "\n";
-                return false;
-            }
+            // the result is converted to the type of the expression at successful_return
+            result.val =
+                eval_int_binary_op(op, lhs_res.val.value(), rhs_res.val.value(), E, ASTctx);
+            goto successful_return;
         }
     } else if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
         const auto *operand = UO->getSubExpr();
@@ -481,42 +571,36 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
                 VD = target;
             }
 
-// temp helper macro to generate all the similar cases
-#define UOP_ASSIGN_POST(OP)                                                                        \
-    {                                                                                              \
-        result.val = state.vars[VD]; /* result is the value before inc/dec */                      \
-        if (state.vars[VD].has_value())                                                            \
-            state.vars[VD].value() OP;                                                             \
-        state.all_possible_vals[VD].insert(state.vars[VD]);                                        \
-        goto successful_return;                                                                    \
-    }
-#define UOP_ASSIGN_PRE(OP)                                                                         \
-    {                                                                                              \
-        if (state.vars[VD].has_value())                                                            \
-            OP state.vars[VD].value();                                                             \
-        result.val = state.vars[VD]; /* result is the value after inc/dec */                       \
-        state.all_possible_vals[VD].insert(state.vars[VD]);                                        \
-        goto successful_return;                                                                    \
-    }
-            // clang-format off
-            switch (op) {
-                // [C99 6.5.2.4] Postfix increment and decrement
-            case UO_PostInc: UOP_ASSIGN_POST(++); break;
-            case UO_PostDec: UOP_ASSIGN_POST(--); break;
-                // [C99 6.5.3.1] Prefix increment and decrement
-            case UO_PreInc: UOP_ASSIGN_PRE(++); break;
-            case UO_PreDec: UOP_ASSIGN_PRE(--); break;
-                // clang-format on
-#undef UOP_ASSIGN_POST
-#undef UOP_ASSIGN_PRE
-            default:
-                // Unreachable
-                INTERNAL_ERROR << " TODO: eval_expr UO opcode not implemented `"
-                               << UO->getOpcodeStr(op) << "` " << loc_str(UO) << "\n";
-                return false;
+            {
+                // the new value is converted to the type of the variable
+                const std::optional<int64_t> before = state.vars[VD];
+                std::optional<int64_t> after;
+                if (before.has_value()) {
+                    after = to_int_type(
+                        eval_int_binary_op((op == UO_PostInc || op == UO_PreInc) ? BO_Add : BO_Sub,
+                                           before.value(), 1, E, ASTctx),
+                        VD->getType(), ASTctx);
+                }
+                state.vars[VD] = after;
+                // postfix gives the value before, prefix the value after
+                result.val = (op == UO_PostInc || op == UO_PostDec) ? before : after;
+                state.all_possible_vals[VD].insert(after);
+                goto successful_return;
             }
 
         } else {
+
+            if (op == UO_AddrOf) {
+                // var we track could be changed through pointer, we do not follow these for now..
+                // needs to be checked also when the value of the variable is unknown
+                if (const VarDecl *VD = lvalue_var(operand, ASTctx);
+                    VD && VD->getType().getNonReferenceType()->isIntegralOrEnumerationType()) {
+                    INTERNAL_ERROR << " Taking the address of an integer variable is not "
+                                      "supported "
+                                   << loc_str(UO) << "\n";
+                    return false;
+                }
+            }
 
             // eval operand
             Eval_result operand_res{};
@@ -529,21 +613,28 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
 
             // clang-format off
             switch (op) {
-                // [C99 6.5.3.2] Address and indirection
-                // UO_AddrOf "&"
-                // UO_Deref "*"
                 // [C99 6.5.3.3] Unary arithmetic
             case UO_Plus:  { result.val = +operand_res.val.value(); goto successful_return; } break;
-            case UO_Minus: { result.val = -operand_res.val.value(); goto successful_return; } break;
+            case UO_Minus: { result.val = eval_int_binary_op(BO_Sub, 0, operand_res.val.value(), E, ASTctx); goto successful_return; } break; // We can reuse the int_binary_op here.. (0 - a)
             case UO_Not:   { result.val = ~operand_res.val.value(); goto successful_return; } break;
             case UO_LNot:  { result.val = !operand_res.val.value(); goto successful_return; } break;
-                // "__real expr"/"__imag expr" Extension.
-                // UO_Real "__real"
-                // UO_Imag "__imag"
                 // __extension__ marker.
                 // UO_Extension "__extension__"
+            case UO_Extension: { result = operand_res; goto successful_return; } break; // the __extension__ marker is just for suppressing compiler messages, so it is just a no-op
                 // [C++ Coroutines] co_await operator
                 // UO_Coawait "co_await"
+                // [C99 6.5.3.2] Address and indirection
+                // UO_AddrOf "&"
+            case UO_AddrOf: // of something we do not track, checked above
+                // UO_Deref "*"
+            case UO_Deref:
+                // "__real expr"/"__imag expr" Extension.
+                // UO_Real "__real"
+            case UO_Real:
+                // UO_Imag "__imag"
+            case UO_Imag:
+                result.val = std::nullopt;
+                goto successful_return;
                 // clang-format on
             default:
                 INTERNAL_ERROR << " TODO: eval_expr UO opcode not implemented `"
@@ -556,15 +647,6 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         // Similarly as the short circuiting for LAnd/LOr, the result is the last evaluated
         // expression. We can reach this with an unknown last_res.
         result.val = state.last_res.val;
-        goto successful_return;
-
-    } else if (const auto *SCE = dyn_cast<CXXStaticCastExpr>(E)) {
-        // TODO: Interpret static_cast as a nop.. This might not be correct..
-        const auto *e = SCE->getSubExpr()->IgnoreImpCasts();
-        if (!eval_expr(result, e, state, ASTctx))
-            return false;
-        if (SCE->getCastKind() == CK_IntegralToBoolean && result.val.has_value())
-            result.val = (bool)result.val.value();
         goto successful_return;
 
     } else if (const auto *CE = dyn_cast<CallExpr>(E)) {
@@ -710,11 +792,40 @@ bool eval_expr(Eval_result &result, const Expr *E, Eval_state &state, ASTContext
         goto successful_return;
     }
 
+    // Other kinds of expressions.
+    { // this catches e.g. `sizeof(int)`
+        Expr::EvalResult constant;
+        if (E->EvaluateAsInt(constant, ASTctx)) {
+            result.val = constant.Val.getInt().tryExtValue();
+            goto successful_return;
+        }
+    }
+    // cases where the expression is a type we dont care about, but its subexpressions may still
+    // change tracked vars, e.g. `S{x++}`
+    if (!isa<CXXNewExpr, CXXDeleteExpr, CXXThrowExpr, StmtExpr, BlockExpr, AtomicExpr,
+             CoroutineSuspendExpr, CXXTypeidExpr, GenericSelectionExpr, UnaryExprOrTypeTraitExpr,
+             CXXNoexceptExpr>(E) &&
+        std::all_of(E->child_begin(), E->child_end(),
+                    [](const Stmt *child) { return child == nullptr || isa<Expr>(child); })) {
+        for (const Stmt *child : E->children()) {
+            if (const auto *child_expr = dyn_cast_or_null<Expr>(child)) {
+                Eval_result child_res{};
+                if (!eval_expr(child_res, child_expr, state, ASTctx))
+                    return false;
+            }
+        }
+        INTERNAL_NOTE_IF(E) << " Not trying to eval " << E->getStmtClassName()
+                            << ", the value is unknown " << loc_str(E) << "\n";
+        goto successful_return;
+    }
+
     INTERNAL_ERROR << "TODO: UNHANDELED EXPR: eval_expr() " << loc_str(E) << "\n";
     E->dump(diags, ASTctx);
     return false;
 
 successful_return:
+    // the value as the type of the expression, unknown if not an integer type
+    result.val = to_int_type(result.val, E->getType(), ASTctx);
     track_expr(result, E, state);
     state.block_expr_state[E] = result.val;
     state.last_res = result;
@@ -755,7 +866,7 @@ bool eval_stmt(const Stmt *S, Eval_state &state, ASTContext &ASTctx) {
                     Eval_result res{};
                     if (!eval_expr(res, init, state, ASTctx))
                         return false;
-                    state.vars[VD] = res.val;
+                    state.vars[VD] = to_int_type(res.val, VD->getType(), ASTctx);
                     // var changes
                     state.all_possible_vals[VD].insert(state.vars[VD]);
                     return true;
@@ -1449,7 +1560,7 @@ static bool eval_CFG_worklist(const CFG &cfg, Eval_state &state, ASTContext &AST
     return true;
 }
 
-// Evaluate a constexpr function called during exec() 
+// Evaluate a constexpr function called during exec()
 // state.vars holds the argument values, the result is in state.return_val.
 static bool eval_constexpr_function(const FunctionDecl *func, Eval_state &state,
                                     ASTContext &ASTctx) {
