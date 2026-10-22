@@ -1775,6 +1775,91 @@ bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
 }
 
 
+/// The number of elements of `base`, if it is an array or std::array, otherwise nullopt
+static std::optional<uint64_t> static_array_size(const Expr *base, ASTContext &ctx) {
+    const QualType type =
+        base->IgnoreParenImpCasts()->getType().getNonReferenceType().getCanonicalType();
+    if (const ConstantArrayType *CAT = ctx.getAsConstantArrayType(type))
+        return CAT->getSize().getZExtValue();
+    if (const auto *CTSD =
+            dyn_cast_or_null<ClassTemplateSpecializationDecl>(type->getAsCXXRecordDecl())) {
+        const TemplateArgumentList &args = CTSD->getTemplateArgs();
+        if (CTSD->getName() == "array" && CTSD->isInStdNamespace() && args.size() == 2 &&
+            args[1].getKind() == TemplateArgument::Integral)
+            return args[1].getAsIntegral().getZExtValue();
+    }
+    return std::nullopt;
+}
+
+/// Emit warning about the index values of a field with a loop local index, e.g. array_of_fields[i],
+/// if they may be out of the bounds of array_of_fields: all the fields array_of_fields[i] may be
+/// accessed before the loop, also for values that are never used if the analysis over-approximates
+/// them, e.g. for conditions it can not evaluate. For example: const int na = n_active; // 2 at run
+/// time onsites (ALL) {
+///     for (int i = 0; i < 4; i++)
+///         if (i < na) f[X] += array_of_fields[i][X];   // = std::array<Field<double>, 2>
+/// }
+/// the above would get possible values for i={0,1,2,3} and generate checks for those, leading to
+/// out of bounds accessess of array_of_fields..
+/// TODO: could try to handle these cases better..
+///
+/// No warning if the values are within the size of an array or std::array, or if a
+/// Direction index is in [0, NDIM) (GaugeField etc. have NDIM elements). An error if the size of
+/// an array or std::array is known and the values exceed it. Returns false on error.
+bool TopLevelVisitor::check_loop_local_ref_bounds(const field_info &fi) {
+    if (!fi.is_loop_local_ref || fi.ref_idx_set.empty())
+        return true;
+
+    const field_ref *first = nullptr;
+    std::string indices; // the index expressions
+    std::set<std::string> seen;
+    for (const field_ref *ref : fi.ref_list) {
+        if (!ref->is_loop_local_ref)
+            continue;
+        if (first == nullptr)
+            first = ref;
+        const std::string idx = get_stmt_str(ref->ref_index);
+        if (seen.insert(idx).second)
+            indices += (indices.empty() ? "" : ", ") + idx;
+    }
+    if (first == nullptr)
+        return true;
+
+    const int64_t min = *fi.ref_idx_set.begin();
+    const int64_t max = *fi.ref_idx_set.rbegin();
+    const std::optional<uint64_t> size = static_array_size(first->ref_base, *Context);
+
+    if (size.has_value() && min >= 0 && static_cast<uint64_t>(max) < *size)
+        return true;
+    if (!size.has_value() && fi.ref_index_type == "Direction" && min >= 0 &&
+        max < number_of_directions() / 2)
+        return true;
+
+    std::string msg = "The index analysis gives a range `" + indices + "` = [" + std::to_string(min) +
+                      " ... " + std::to_string(max) + "] for Field '" + fi.old_name + "'";
+    if (size.has_value()) {
+        // the generated code is certain to access out of bounds: an error
+        msg += ", but '" + fi.ref_base_str + "' has " + std::to_string(*size) +
+               " elements. The generated code accesses the fields of all these index values "
+               "before the loop, which would be out of bounds (the values can be an "
+               "over-approximation of the values used at run time).";
+        reportDiag(DiagnosticsEngine::Level::Error, first->ref_index->getSourceRange().getBegin(),
+                   "%0", msg.c_str());
+        return false;
+    } else {
+        msg += ". The generated code accesses the fields of all these index values before the "
+               "loop: make sure '" +
+               fi.ref_base_str + "' has ";
+        msg += (min >= 0) ? "at least " + std::to_string(max + 1) + " elements"
+                          : "elements for all these index values";
+        msg += ", otherwise the program may crash";
+    }
+    reportDiag(DiagnosticsEngine::Level::Warning, first->ref_index->getSourceRange().getBegin(),
+               "%0", msg.c_str());
+    return true;
+}
+
+
 /// The number of directions NDIRS = 2 * NDIM, TODO: is this the best way to do this...
 int TopLevelVisitor::number_of_directions() {
     static int ndirs = -1;
@@ -2035,6 +2120,8 @@ bool TopLevelVisitor::check_field_ref_list() {
                 no_errors = false;
             }
         }
+        if (!check_loop_local_ref_bounds(l))
+            no_errors = false;
     }
 
     for (field_info &l : field_info_list) {
