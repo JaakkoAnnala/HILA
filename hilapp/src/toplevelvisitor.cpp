@@ -1705,7 +1705,7 @@ bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
         if (!ok || vals == nullptr || !reliable) {
             reportDiag(DiagnosticsEngine::Level::Error, r.ref_index->getSourceRange().getBegin(),
                        "Could not determine the values index '%0' of Field '%1' can have in the "
-                       "onsites-loop",
+                       "onsites-loop (add option -idx-eval-diags to print internal diagnostics of the index eval)",
                        get_stmt_str(r.ref_index).c_str(), get_stmt_str(r.nameExpr).c_str());
             all_found = false;
             continue;
@@ -1744,10 +1744,11 @@ bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
     }
 
     if (!all_found) {
-        // TODO: print these only with a command line option?
-        llvm::errs() << "---------- Idx_expr_evaluator internal diagnostics -----------\n";
-        evaluator.print_eval_diags(llvm::errs());
-        llvm::errs() << "--------------------------------------------------------------\n";
+        if (cmdline::idx_eval_diags) {
+            llvm::errs() << "---------- Idx_expr_evaluator internal diagnostics -----------\n";
+            evaluator.print_eval_diags(llvm::errs());
+            llvm::errs() << "--------------------------------------------------------------\n";
+        }
     }
     return all_found;
 }
