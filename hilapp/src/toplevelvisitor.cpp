@@ -1705,7 +1705,8 @@ bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
         if (!ok || vals == nullptr || !reliable) {
             reportDiag(DiagnosticsEngine::Level::Error, r.ref_index->getSourceRange().getBegin(),
                        "Could not determine the values index '%0' of Field '%1' can have in the "
-                       "onsites-loop (add option -idx-eval-diags to print internal diagnostics of the index eval)",
+                       "onsites-loop (add option -idx-eval-diags to print internal diagnostics of "
+                       "the index eval)",
                        get_stmt_str(r.ref_index).c_str(), get_stmt_str(r.nameExpr).c_str());
             all_found = false;
             continue;
@@ -1713,11 +1714,27 @@ bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
         r.ref_idx_set.clear();
         for (const std::optional<int64_t> &v : *vals)
             r.ref_idx_set.insert(v.value());
+
+        // warn no values: the reference is not on any execution path..
+        if (r.ref_idx_set.empty())
+            reportDiag(DiagnosticsEngine::Level::Warning, r.fullExpr->getSourceRange().getBegin(),
+                       "Field reference '%0' is never executed in the onsites-loop, the index "
+                       "'%1' has no possible values",
+                       get_stmt_str(r.fullExpr).c_str(), get_stmt_str(r.ref_index).c_str());
     }
 
     // The directions: X - dir is the opposite direction. A reference that is
     // never evaluated has no directions, it is not executed.
     const int ndirs = number_of_directions();
+    bool all_dirs_found = true;
+    // If not known, all directions are gathered, reported warning
+    auto report_dirs_not_found = [&](const field_ref &r) {
+        all_dirs_found = false;
+        reportDiag(DiagnosticsEngine::Level::Warning, r.parityExpr->getSourceRange().getBegin(),
+                   "Gathering all directions: could not determine the directions in field access "
+                   "'%0' in the onsites-loop. May result in unnecesary communications.",
+                   get_stmt_str(r.fullExpr).c_str());
+    };
     for (field_ref &r : field_ref_list) {
         if (!has_loop_local_nb_dir(r))
             continue;
@@ -1725,8 +1742,10 @@ bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
         r.loop_local_dirs_known = false;
 
         const auto [tuples, reliable] = evaluator.get_tuples_for_expr(r.fullExpr);
-        if (!ok || tuples == nullptr || !reliable || ndirs <= 0)
+        if (!ok || tuples == nullptr || !reliable || ndirs <= 0) {
+            report_dirs_not_found(r);
             continue;
+        }
 
         bool valid = true;
         for (const Value_tuple &t : *tuples) {
@@ -1741,9 +1760,11 @@ bool TopLevelVisitor::analyse_loop_local_field_refs(Stmt *loop_body) {
             r.loop_local_dirs.insert({idx, dir});
         }
         r.loop_local_dirs_known = valid;
+        if (!valid)
+            report_dirs_not_found(r);
     }
 
-    if (!all_found) {
+    if (!all_found || !all_dirs_found) {
         if (cmdline::idx_eval_diags) {
             llvm::errs() << "---------- Idx_expr_evaluator internal diagnostics -----------\n";
             evaluator.print_eval_diags(llvm::errs());

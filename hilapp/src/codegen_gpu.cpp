@@ -989,6 +989,13 @@ std::string TopLevelVisitor::generate_code_gpu(Stmt *S, bool semicolon_at_end, s
     // Create temporary field element variables
     for (field_info &l : field_info_list) {
 
+        if (l.is_loop_local_ref && l.ref_idx_set.empty()) {
+            // the index has no possible values, the references are never executed 
+            for (field_ref *ref : l.ref_list)
+                loopBuf.replace(ref->fullExpr, l.element_type + "()");
+            continue;
+        }
+
         if (l.is_loop_local_ref) {
             // The field depends on a loop local variable, e.g. U[mu]: select the storage of the
             // field with the value of the index for each reference, see hila::select_storage().
